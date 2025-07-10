@@ -1,0 +1,60 @@
+{
+  "name": "Intercom NPS Pipeline",
+  "description": "Pipeline that fetches NPS data from Intercom, calculates metrics and saves to BigQuery and Google Sheets",
+  "parameters": [
+    {
+      "name": "api_key",
+      "label": "Intercom API Key",
+      "helpText": "API key for accessing Intercom data",
+      "paramType": "TEXT",
+      "isOptional": false
+    },
+    {
+      "name": "target_table",
+      "label": "BigQuery Target Table",
+      "helpText": "BigQuery table for NPS data in format project:dataset.table",
+      "paramType": "TEXT",
+      "isOptional": false,
+      "regexes": [
+        "^[^:]+:[^.]+\\.[^.]+$"
+      ]
+    },
+    {
+      "name": "spreadsheet_id",
+      "label": "Google Spreadsheet ID",
+      "helpText": "Google Spreadsheet ID for NPS reviews",
+      "paramType": "TEXT",
+      "isOptional": false
+    },
+    {
+      "name": "start_date",
+      "label": "Start Date",
+      "helpText": "Start date in ISO format (YYYY-MM-DDThh:mm:ssZ). Optional, defaults to first day of previous month.",
+      "paramType": "TEXT",
+      "isOptional": true
+    },
+    {
+      "name": "end_date",
+      "label": "End Date",
+      "helpText": "End date in ISO format (YYYY-MM-DDThh:mm:ssZ). Optional, defaults to first day of current month.",
+      "paramType": "TEXT",
+      "isOptional": true
+    },
+    {
+      "name": "credentials_path",
+      "label": "Service Account Credentials Path",
+      "helpText": "Path to service account credentials file for accessing Google Sheets. If not provided, Application Default Credentials will be used.",
+      "paramType": "TEXT",
+      "isOptional": true
+    }
+  ],
+  "defaultEnvironment": {
+    "numWorkers": 2,
+    "maxWorkers": 5,
+    "serviceAccountEmail": "986072438729-compute@developer.gserviceaccount.com",
+    "machineType": "n1-standard-2",
+    "additionalExperiments": [
+      "use_runner_v2"
+    ]
+  }
+}
