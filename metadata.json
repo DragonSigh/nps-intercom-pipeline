@@ -85,17 +85,6 @@
       "regexes": [
         "^(true|false)$"
       ]
-    },
-    {
-      "name": "debug_data_only",
-      "label": "Data Structure Debug Mode",
-      "helpText": "Run only data structure analysis without processing. Useful for understanding Intercom export format and troubleshooting data issues. Pipeline will exit after showing data structure.",
-      "paramType": "TEXT",
-      "isOptional": true,
-      "defaultValue": "false",
-      "regexes": [
-        "^(true|false)$"
-      ]
     }
   ]
 }
