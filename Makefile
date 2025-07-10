@@ -25,4 +25,4 @@ test:
 
 lint:
 	ruff nps_intercom.py
-	black --check nps_intercom.py 
+	black --check nps_intercom.py

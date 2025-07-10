@@ -1,19 +1,31 @@
-FROM gcr.io/dataflow-templates-base/python311-template-launcher-base
+# ------------------------------------------------------------------------------
+# Dataflow Flex-Template: launcher + SDK harness (Python 3.11)
+# ------------------------------------------------------------------------------
 
-ARG WORKDIR=/template
-WORKDIR ${WORKDIR}
+    FROM gcr.io/dataflow-templates-base/python311-template-launcher-base
 
-COPY requirements.txt .
-COPY setup.py .
-COPY nps_intercom.py .
-
-# Install Python dependencies and upgrade pip
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Set timezone for correct date handling
-ENV TZ=Europe/Moscow
-
-# Entrypoint configuration for Flex Template launcher
-ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/nps_intercom.py"
-ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
+    # ---------- build-time variable (pass via --build-arg) ----------
+    ARG PROJECT_ID
+    ARG WORKDIR=/template
+    
+    WORKDIR ${WORKDIR}
+    
+    # ---------- copy sources ----------
+    COPY requirements.txt requirements.txt
+    COPY setup.py         setup.py
+    COPY nps_intercom.py  nps_intercom.py
+    COPY metadata.json    metadata.json
+    
+    # ---------- install dependencies & local package ----------
+    RUN pip install --no-cache-dir -r requirements.txt \
+     && pip install --no-cache-dir .
+    
+    # ---------- Flex-template variables ----------
+    # путь к main.py
+    ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/nps_intercom.py"
+    
+    # setup.py передаётся в Job, чтобы Beam установил пакет и на воркерах
+    ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
+    
+    # чтобы импорты видели /template
+    ENV PYTHONPATH="${WORKDIR}"
