@@ -1,6 +1,6 @@
 {
   "name": "Intercom NPS Pipeline",
-  "description": "Advanced pipeline that fetches NPS data from Intercom Series with intelligent data structure detection, calculates metrics and saves to BigQuery and Google Sheets. Features enhanced diagnostics, flexible period collection (monthly/quarterly), and robust data parsing for various Intercom export formats.",
+  "description": "Pipeline that fetches NPS data from Intercom with streaming processing and enhanced error handling. Calculates metrics and saves to BigQuery and Google Sheets.",
   "parameters": [
     {
       "name": "api_key",
@@ -28,8 +28,8 @@
     },
     {
       "name": "period_type",
-      "label": "Collection Period Type",
-      "helpText": "Type of collection period: 'monthly' for monthly collection or 'quarterly' for quarterly collection",
+      "label": "Period Type",
+      "helpText": "Collection period: 'monthly' or 'quarterly'",
       "paramType": "TEXT",
       "isOptional": true,
       "defaultValue": "monthly",
@@ -40,7 +40,7 @@
     {
       "name": "period_offset",
       "label": "Period Offset",
-      "helpText": "How many periods back to collect data (1 = previous period, 2 = two periods back, etc.)",
+      "helpText": "Periods back to collect (1 = previous period, 2 = two periods back)",
       "paramType": "TEXT",
       "isOptional": true,
       "defaultValue": "1",
@@ -50,8 +50,8 @@
     },
     {
       "name": "start_date",
-      "label": "Start Date (Override)",
-      "helpText": "Override start date in format YYYY-MM-DD. If provided, period_type and period_offset are ignored.",
+      "label": "Start Date",
+      "helpText": "Start date in YYYY-MM-DD format (overrides period settings)",
       "paramType": "TEXT",
       "isOptional": true,
       "regexes": [
@@ -60,8 +60,8 @@
     },
     {
       "name": "end_date",
-      "label": "End Date (Override)",
-      "helpText": "Override end date in format YYYY-MM-DD. Must be provided together with start_date.",
+      "label": "End Date",
+      "helpText": "End date in YYYY-MM-DD format (use with start_date)",
       "paramType": "TEXT",
       "isOptional": true,
       "regexes": [
@@ -70,15 +70,15 @@
     },
     {
       "name": "credentials_path",
-      "label": "Service Account Credentials Path",
-      "helpText": "Path to service account credentials file for accessing Google Sheets. If not provided, Application Default Credentials will be used.",
+      "label": "Credentials Path",
+      "helpText": "Path to service account credentials for Google Sheets",
       "paramType": "TEXT",
       "isOptional": true
     },
     {
       "name": "debug",
       "label": "Debug Mode",
-      "helpText": "Enable debug mode to disable period filtering and process all available data with enhanced logging",
+      "helpText": "Enable debug mode (process all data without period filtering)",
       "paramType": "TEXT",
       "isOptional": true,
       "defaultValue": "false",

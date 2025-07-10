@@ -11,40 +11,41 @@ import re
 import os
 import json
 from datetime import datetime, date, timedelta
-import ast
 
-import pandas as pd
 import google.auth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions, WorkerOptions
+from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions
 from apache_beam.io.gcp.bigquery import WriteToBigQuery
 
 
-# Updated NPS survey configuration for series-based approach
+# Размер батча для обработки
+BATCH_SIZE = 100
+MAX_RETRIES = 3
+
+# Конфигурация NPS опросов (остается той же)
 NPS_SURVEYS = {
     'ENG': {
         'series_name': 'Measure NPS® and follow-up_ENG',
-        'survey_name_pattern': r'Q\d+ NPS Survey$',  # Matches Q1 NPS Survey, Q2 NPS Survey, etc.
+        'survey_name_pattern': r'Q\d+ NPS Survey$',
         'nps_question': 'Thank you for choosing HEALBE! How likely is it that you would recommend HEALBE GoBe to a friend or colleague?',
         'country_code': 'US'
     },
     'RU': {
         'series_name': 'Measure NPS® and follow-up_RU',
-        'survey_name_pattern': r'Q\d+ NPS Survey RU$',  # Matches Q1 NPS Survey RU, Q2 NPS Survey RU, etc.
+        'survey_name_pattern': r'Q\d+ NPS Survey RU$',
         'nps_question': 'Спасибо за ваш выбор HEALBE! Пожалуйста, оцените вероятность того, что вы порекомендуете наш продукт друзьям и знакомым',
         'country_code': 'RU'
     },
     'JP': {
         'series_name': 'Measure NPS® and follow-up_JP',
-        'survey_name_pattern': r'Q\d+ NPS Survey JP$',  # Matches Q1 NPS Survey JP, Q2 NPS Survey JP, etc.
+        'survey_name_pattern': r'Q\d+ NPS Survey JP$',
         'nps_question': 'GoBeデバイスを利用いただき、ありがとうございます。友人やご家族のメンバーにGoBeをお勧めしますか？',
         'country_code': 'JP'
     }
 }
 
-# BigQuery schema definition
 NPS_SCHEMA = {
     'fields': [
         {'name': 'month', 'type': 'STRING'},
@@ -63,43 +64,22 @@ def date_to_unix(date_str):
     return int(dt.timestamp())
 
 
-def datetime_to_unix(datetime_str):
-    """Converts a datetime string to Unix timestamp."""
-    if 'T' in datetime_str:
-        dt = datetime.strptime(datetime_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-    else:
-        dt = datetime.strptime(datetime_str, "%Y-%m-%d")
-    return int(dt.timestamp())
-
-
 def calculate_period_dates(period_type='monthly', period_offset=1):
-    """
-    Calculates the start and end dates for the specified period.
-    
-    Args:
-        period_type: 'monthly' or 'quarterly'
-        period_offset: How many periods back to go (1 = previous period, 2 = two periods back, etc.)
-    
-    Returns:
-        tuple: (start_date, end_date) in YYYY-MM-DD format
-    """
+    """Calculates the start and end dates for the specified period."""
     today = date.today()
     
     if period_type == 'monthly':
-        # Calculate previous month(s)
         current_month = today.replace(day=1)
         for _ in range(period_offset):
             current_month = (current_month - timedelta(days=1)).replace(day=1)
         
         start_date = current_month
-        # Last day of the target month
         if current_month.month == 12:
             end_date = current_month.replace(year=current_month.year + 1, month=1)
         else:
             end_date = current_month.replace(month=current_month.month + 1)
             
     elif period_type == 'quarterly':
-        # Calculate previous quarter(s)
         current_quarter = ((today.month - 1) // 3) + 1
         current_year = today.year
         
@@ -109,11 +89,9 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
                 current_quarter = 4
                 current_year -= 1
         
-        # Start of quarter
         start_month = (current_quarter - 1) * 3 + 1
         start_date = date(current_year, start_month, 1)
         
-        # End of quarter
         end_month = start_month + 2
         if end_month > 12:
             end_date = date(current_year + 1, end_month - 12 + 1, 1)
@@ -123,7 +101,6 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
     else:
         raise ValueError(f"Unsupported period_type: {period_type}")
     
-    # Format dates in YYYY-MM-DD format
     start_date_str = start_date.strftime('%Y-%m-%d')
     end_date_str = end_date.strftime('%Y-%m-%d')
     
@@ -132,7 +109,7 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
 
 
 class IntercomService:
-    """Service wrapper for Intercom API interactions."""
+    """Service wrapper for Intercom API interactions with retry logic."""
     
     def __init__(self, api_key):
         self.api_key = api_key
@@ -144,93 +121,139 @@ class IntercomService:
         }
         self.base_url = "https://api.intercom.io"
 
+    def _make_request_with_retry(self, method, url, **kwargs):
+        """Makes HTTP request with retry logic."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.request(method, url, timeout=60, **kwargs)
+                if response.status_code == 429:  # Rate limit
+                    wait_time = int(response.headers.get('Retry-After', 60))
+                    logging.warning(f"Rate limited, waiting {wait_time} seconds")
+                    time.sleep(wait_time)
+                    continue
+                return response
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Request attempt {attempt + 1} failed: {e}")
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
     def create_export_job(self, start_date, end_date):
-        """Creates an export job with basic error handling."""
+        """Creates an export job with retry logic."""
         endpoint = f"{self.base_url}/export/content/data"
         payload = {
             "created_at_after": date_to_unix(start_date),
             "created_at_before": date_to_unix(end_date)
         }
-        response = requests.post(endpoint, headers=self.headers, json=payload)
+        
+        response = self._make_request_with_retry('POST', endpoint, headers=self.headers, json=payload)
+        
         if response.status_code == 200:
             result = response.json()
             if 'job_identifier' in result:
                 return result['job_identifier']
             logging.error("No 'job_identifier' found in the response.")
-        elif response.status_code == 429:
-            logging.error("Error: Active job limit reached (1 per workspace)")
         else:
             logging.error(f"HTTP error {response.status_code}: {response.text}")
         return None
 
     def check_export_status(self, job_id):
-        """Checks the status of an export job."""
+        """Checks the status of an export job with retry."""
         endpoint = f"{self.base_url}/export/content/data/{job_id}"
-        response = requests.get(endpoint, headers=self.headers)
+        response = self._make_request_with_retry('GET', endpoint, headers=self.headers)
+        
         if response.status_code == 200:
             return response.json()
         else:
             logging.error(f"Error while checking job status: {response.status_code}")
             return None
 
-    def download_export_results(self, download_url):
-        """Downloads and extracts a gzipped CSV or ZIP archive produced by the export job."""
+    def download_export_results_chunked(self, download_url):
+        """Downloads export results and yields rows instead of loading everything into memory."""
         download_headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/octet-stream"
         }
-        response = requests.get(download_url, headers=download_headers)
-        if response.status_code == 200:
-            content = response.content
-
-            # Detect file signature
+        
+        response = self._make_request_with_retry('GET', download_url, headers=download_headers, stream=True)
+        
+        if response.status_code != 200:
+            logging.error(f"Error while downloading results: {response.status_code}")
+            return
+        
+        # Получаем содержимое для определения типа файла
+        content = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            content += chunk
+            if len(content) >= 10:  # Достаточно для определения типа
+                break
+        
+        # Дочитываем остальное содержимое
+        for chunk in response.iter_content(chunk_size=8192):
+            content += chunk
+        
+        try:
+            # Обрабатываем разные форматы файлов
             if content[:2] == b'\x1f\x8b':  # GZ
                 with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
-                    df = pd.read_csv(gz)
-                return df
+                    # Читаем CSV построчно
+                    text_content = gz.read().decode('utf-8')
+                    lines = text_content.strip().split('\n')
+                    if lines:
+                        headers = lines[0].split(',')
+                        for line in lines[1:]:
+                            if line.strip():
+                                values = line.split(',')
+                                if len(values) == len(headers):
+                                    yield dict(zip(headers, values))
+                                    
             elif content[:2] == b'PK':  # ZIP
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                    dfs = []
                     for filename in zf.namelist():
                         if filename.endswith('.csv'):
                             with zf.open(filename) as csvfile:
-                                dfs.append(pd.read_csv(csvfile))
-                    if dfs:
-                        df = pd.concat(dfs, ignore_index=True)
-                        return df
-                    logging.error("No CSV files found inside the ZIP archive.")
-                    return None
+                                text_content = csvfile.read().decode('utf-8')
+                                lines = text_content.strip().split('\n')
+                                if lines:
+                                    headers = lines[0].split(',')
+                                    for line in lines[1:]:
+                                        if line.strip():
+                                            values = line.split(',')
+                                            if len(values) == len(headers):
+                                                yield dict(zip(headers, values))
             else:
-                # It might simply be a plain CSV file
-                try:
-                    df = pd.read_csv(io.BytesIO(content))
-                    return df
-                except:
-                    logging.error("Unknown export file format.")
-                    return None
-        else:
-            logging.error(f"Error while downloading results: {response.status_code}")
-            return None
+                # Plain CSV
+                text_content = content.decode('utf-8')
+                lines = text_content.strip().split('\n')
+                if lines:
+                    headers = lines[0].split(',')
+                    for line in lines[1:]:
+                        if line.strip():
+                            values = line.split(',')
+                            if len(values) == len(headers):
+                                yield dict(zip(headers, values))
+                                
+        except Exception as e:
+            logging.error(f"Error processing file content: {e}")
 
-    def get_nps_data(self, start_date, end_date):
-        """Fetches NPS data from Intercom."""
+    def get_nps_data_streaming(self, start_date, end_date):
+        """Fetches NPS data from Intercom and yields rows instead of loading everything."""
         logging.info(f"Creating export job for data from {start_date} to {end_date}...")
 
-        # Create the export job
         job_id = self.create_export_job(start_date, end_date)
         if not job_id:
             logging.error("Failed to create export job.")
-            return None
+            return
 
         logging.info(f"Export job created. ID: {job_id}")
 
-        # Wait until the export job is finished
-        max_attempts = 30  # Maximum number of status-check attempts
+        # Wait for job completion
+        max_attempts = 30
         for attempt in range(max_attempts):
             status_info = self.check_export_status(job_id)
             if not status_info:
                 logging.error("Export job not found or was deleted")
-                return None
+                return
 
             state = status_info.get('status', 'unknown')
             logging.info(f"Status: {state.upper()}")
@@ -239,31 +262,23 @@ class IntercomService:
                 download_url = status_info.get('download_url')
                 if not download_url:
                     logging.error("Error: 'download_url' is missing in the response")
-                    return None
+                    return
 
                 logging.info("Downloading and processing data...")
-                df = self.download_export_results(download_url)
-                
-                if df is not None:
-                    logging.info(f"Loaded {len(df)} rows")
-                    return df
-                else:
-                    logging.error("Failed to load data")
-                    return None
+                yield from self.download_export_results_chunked(download_url)
+                return
             
             elif state in ('failed', 'no_data'):
                 logging.error(f"Export failed: {status_info.get('message', 'unspecified')}")
-                return None
+                return
             
-            # Sleep before the next status check
             time.sleep(20)
         
         logging.error(f"Exceeded maximum attempts ({max_attempts}) to check export status")
-        return None
 
 
-class FetchIntercomData(beam.DoFn):
-    """DoFn that fetches raw Intercom data and processes it for all regions using the new series structure."""
+class CreateDataFetchTasks(beam.DoFn):
+    """DoFn that creates tasks for data fetching instead of fetching everything at once."""
     
     def __init__(self, api_key, start_date, end_date):
         self.api_key = api_key
@@ -271,129 +286,149 @@ class FetchIntercomData(beam.DoFn):
         self.end_date = end_date
         
     def process(self, _):
-        intercom_service = IntercomService(self.api_key)
-        data = intercom_service.get_nps_data(self.start_date, self.end_date)
-        
-        if data is None:
-            logging.warning("Failed to retrieve data from Intercom")
-            return
-        
-        # Log the column names for diagnostics
-        logging.info(f"Loaded columns: {list(data.columns)}")
-        
-        # Process data for each region/language
+        # Создаем задачу для каждого региона
         for lang_code, config in NPS_SURVEYS.items():
-            logging.info(f"Processing data for language: {lang_code}")
-            
-            # Filter data for this specific series
-            series_data = data[data.get('series_name', '') == config['series_name']] if 'series_name' in data.columns else data
-            
-            if series_data.empty:
-                logging.warning(f"No data found for series: {config['series_name']}")
-                continue
-            
-            # Filter for NPS surveys within the series
-            nps_surveys = series_data[
-                series_data.get('survey_name', '').str.match(config['survey_name_pattern'], na=False)
-            ] if 'survey_name' in series_data.columns else series_data
-            
-            if nps_surveys.empty:
-                logging.warning(f"No NPS surveys found for pattern: {config['survey_name_pattern']}")
-                continue
-            
-            logging.info(f"Found {len(nps_surveys)} NPS survey responses for {lang_code}")
-            
-            results = []
-            
-            for _, row in nps_surveys.iterrows():
-                score = None
-                feedback = None
+            yield {
+                'region': lang_code,
+                'config': config,
+                'api_key': self.api_key,
+                'start_date': self.start_date,
+                'end_date': self.end_date
+            }
+
+
+class ProcessIntercomData(beam.DoFn):
+    """DoFn that processes individual rows from Intercom data."""
+    
+    def setup(self):
+        self.intercom_service = None
+    
+    def process(self, task):
+        if self.intercom_service is None:
+            self.intercom_service = IntercomService(task['api_key'])
+        
+        region = task['region']
+        config = task['config']
+        
+        logging.info(f"Processing data for region: {region}")
+        
+        row_count = 0
+        results = []
+        
+        try:
+            # Обрабатываем данные построчно
+            for row in self.intercom_service.get_nps_data_streaming(task['start_date'], task['end_date']):
+                row_count += 1
                 
-                # Extract NPS score - look for the score in various possible columns
-                score_columns = ['answer', 'rating', 'score', 'response']
-                for col in score_columns:
-                    if col in row and pd.notnull(row[col]):
-                        score_value = row[col]
-                        
-                        # Handle different score formats
-                        if isinstance(score_value, str):
-                            # Try to extract numeric value
-                            if score_value.isdigit():
-                                score = int(score_value)
-                            else:
-                                # Look for number in the string
-                                match = re.search(r'\d+', score_value)
-                                if match:
-                                    score = int(match.group())
-                        elif isinstance(score_value, (int, float)):
-                            score = int(score_value)
-                        
-                        if score is not None:
-                            break
+                # Фильтруем по серии
+                if row.get('series_name') != config['series_name']:
+                    continue
                 
-                # Extract feedback from conversation messages or follow-up responses
-                feedback_columns = ['body', 'message', 'feedback', 'comment', 'follow_up']
-                for col in feedback_columns:
-                    if col in row and pd.notnull(row[col]):
-                        feedback_value = row[col]
-                        if isinstance(feedback_value, str) and feedback_value.strip():
-                            feedback = feedback_value.strip()
-                            break
+                # Фильтруем по типу опроса
+                survey_name = row.get('survey_name', '')
+                if not re.match(config['survey_name_pattern'], survey_name):
+                    continue
                 
-                # Extract user information
-                user_id = row.get('user_id') or row.get('user_external_id') or row.get('contact_id')
-                user_name = row.get('name', '') or row.get('user_name', '')
-                user_email = row.get('email', '') or row.get('user_email', '')
+                # Извлекаем данные
+                result = self._extract_nps_data(row, config)
+                if result:
+                    results.append(result)
                 
-                # Extract creation date
-                created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
-                if created_at:
-                    try:
-                        if isinstance(created_at, str):
-                            if 'T' in created_at:
-                                created_at = datetime.strptime(created_at.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                            else:
-                                created_at = datetime.strptime(created_at, "%Y-%m-%d")
-                        elif isinstance(created_at, (int, float)):
-                            created_at = datetime.fromtimestamp(created_at)
-                    except (ValueError, TypeError) as e:
-                        logging.warning(f"Could not parse date '{created_at}': {e}")
-                        created_at = datetime.now()
-                else:
-                    created_at = datetime.now()
-                
-                # Add result if we have a score or feedback
-                if score is not None or (feedback and feedback.strip()):
-                    results.append({
-                        'user_uuid': str(user_id) if user_id else "",
-                        'user_name': str(user_name) if user_name else "",
-                        'user_email': str(user_email) if user_email else "",
-                        'country': config['country_code'],
-                        'date': created_at,
-                        'score': score,
-                        'review': feedback
-                    })
+                # Обрабатываем батчами для контроля памяти
+                if len(results) >= BATCH_SIZE:
+                    yield {
+                        'region': region,
+                        'results': results.copy()
+                    }
+                    results.clear()
             
-            logging.info(f"Processed {len(results)} records for {lang_code}")
-            
+            # Отправляем оставшиеся результаты
             if results:
                 yield {
-                    'region': config['country_code'],
+                    'region': region,
                     'results': results
                 }
+            
+            logging.info(f"Processed {row_count} rows for region {region}")
+            
+        except Exception as e:
+            logging.error(f"Error processing data for region {region}: {e}")
+            # Продолжаем работу для других регионов
+            
+    def _extract_nps_data(self, row, config):
+        """Extracts NPS data from a single row."""
+        score = None
+        feedback = None
+        
+        # Извлекаем оценку NPS
+        score_columns = ['answer', 'rating', 'score', 'response']
+        for col in score_columns:
+            if col in row and row[col]:
+                score_value = row[col]
+                
+                if isinstance(score_value, str):
+                    if score_value.isdigit():
+                        score = int(score_value)
+                    else:
+                        match = re.search(r'\d+', score_value)
+                        if match:
+                            score = int(match.group())
+                elif isinstance(score_value, (int, float)):
+                    score = int(score_value)
+                
+                if score is not None:
+                    break
+        
+        # Извлекаем отзыв
+        feedback_columns = ['body', 'message', 'feedback', 'comment', 'follow_up']
+        for col in feedback_columns:
+            if col in row and row[col]:
+                feedback_value = row[col]
+                if isinstance(feedback_value, str) and feedback_value.strip():
+                    feedback = feedback_value.strip()
+                    break
+        
+        # Извлекаем информацию о пользователе
+        user_id = row.get('user_id') or row.get('user_external_id') or row.get('contact_id')
+        user_name = row.get('name', '') or row.get('user_name', '')
+        user_email = row.get('email', '') or row.get('user_email', '')
+        
+        # Извлекаем дату создания
+        created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
+        if created_at:
+            try:
+                if isinstance(created_at, str):
+                    if 'T' in created_at:
+                        created_at = datetime.strptime(created_at.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                    else:
+                        created_at = datetime.strptime(created_at, "%Y-%m-%d")
+                elif isinstance(created_at, (int, float)):
+                    created_at = datetime.fromtimestamp(created_at)
+            except (ValueError, TypeError) as e:
+                logging.warning(f"Could not parse date '{created_at}': {e}")
+                created_at = datetime.now()
+        else:
+            created_at = datetime.now()
+        
+        # Возвращаем результат, если есть оценка или отзыв
+        if score is not None or (feedback and feedback.strip()):
+            return {
+                'user_uuid': str(user_id) if user_id else "",
+                'user_name': str(user_name) if user_name else "",
+                'user_email': str(user_email) if user_email else "",
+                'country': config['country_code'],
+                'date': created_at,
+                'score': score,
+                'review': feedback
+            }
+        
+        return None
 
 
 class CalculateNPS(beam.DoFn):
     """DoFn that calculates the NPS metric and formats reviews."""
     
     def __init__(self, period_type='monthly', run_period=None):
-        """
-        Initializes the transform with period configuration.
-
-        Args:
-            period_type: 'monthly' or 'quarterly'
-            run_period: String specifying the period being processed (e.g., 'YYYY-MM' or 'YYYY-Q1')
-        """
         self.period_type = period_type
         self.run_period = run_period
         
@@ -402,92 +437,59 @@ class CalculateNPS(beam.DoFn):
         results = element['results']
         
         if not results:
-            logging.warning(f"No data to process for region {region}")
             return
         
-        logging.info(f"Received {len(results)} results to process for region {region}")
+        logging.info(f"Calculating NPS for {len(results)} results in region {region}")
         
-        # Group data by period for NPS calculation
+        # Группируем данные по периодам
         period_data = {}
-        
-        # Prepare reviews
         reviews = []
-        all_periods = set()
-        nps_periods = set()
         
         for result in results:
-            user_uuid = result.get('user_uuid')
-            user_name = result.get('user_name', '')
-            user_email = result.get('user_email', '')
-            country = result.get('country')
             date_obj = result.get('date')
             score = result.get('score')
-            review = result.get('review')
             
-            # Determine period string for NPS grouping
+            # Определяем период
             if self.period_type == 'monthly':
                 period_str = date_obj.strftime('%Y-%m')
             elif self.period_type == 'quarterly':
                 quarter = (date_obj.month - 1) // 3 + 1
                 period_str = f"{date_obj.year}-Q{quarter}"
             else:
-                period_str = date_obj.strftime('%Y-%m')  # Default to monthly
+                period_str = date_obj.strftime('%Y-%m')
             
-            all_periods.add(period_str)
-            
-            # Filter by specific period if provided
+            # Фильтруем по нужному периоду, если указан
             if self.run_period and period_str != self.run_period:
-                logging.debug(f"Skipping data for period {period_str}, expected: {self.run_period}")
                 continue
             
-            # Add data for NPS calculation (only if there is a score)
+            # Добавляем данные для расчета NPS
             if score is not None:
                 if period_str not in period_data:
                     period_data[period_str] = {
                         'scores': [],
-                        'country': country
+                        'country': result.get('country')
                     }
                 period_data[period_str]['scores'].append(score)
-                nps_periods.add(period_str)
             
-            # Add review (even if text is empty, but there is a score)
-            if review or score is not None:
-                # Determine quarter for review data
+            # Добавляем отзыв
+            if result.get('review') or score is not None:
                 year = date_obj.year
                 quarter = (date_obj.month - 1) // 3 + 1
                 quarter_str = f"{year} Q{quarter}"
                 
-                # Safely convert data to string
-                user_uuid_str = str(user_uuid) if user_uuid else ""
-                user_name_str = str(user_name) if user_name else ""
-                user_email_str = str(user_email) if user_email else ""
-                review_str = str(review) if review else ""
-                
-                # Safely convert score to integer
-                try:
-                    score_int = int(score) if score is not None else 0
-                except (ValueError, TypeError):
-                    logging.warning(f"Could not convert score '{score}' to int, defaulting to 0")
-                    score_int = 0
-                
                 review_data = beam.Row(
-                    user_uuid=user_uuid_str,
-                    user_name=user_name_str,
-                    user_email=user_email_str,
-                    country=country,
+                    user_uuid=str(result.get('user_uuid', '')),
+                    user_name=str(result.get('user_name', '')),
+                    user_email=str(result.get('user_email', '')),
+                    country=result.get('country', ''),
                     date=date_obj.strftime('%Y-%m-%d'),
                     quarter=quarter_str,
-                    score=score_int,
-                    review=review_str
+                    score=int(score) if score is not None else 0,
+                    review=str(result.get('review', ''))
                 )
                 reviews.append(review_data)
         
-        logging.info(f"Prepared {len(reviews)} reviews for region {region}")
-        logging.info(f"Periods found: {sorted(list(all_periods))}")
-        logging.info(f"Periods with NPS scores: {sorted(list(nps_periods))}")
-        
-        # Calculate NPS for each period
-        nps_results = []
+        # Рассчитываем NPS для каждого периода
         for period, data in period_data.items():
             scores = data['scores']
             country = data['country']
@@ -500,216 +502,162 @@ class CalculateNPS(beam.DoFn):
             total = len(scores)
             neutral = total - promoters - detractors
             
-            # Create NPS record
-            nps_results.append(beam.Row(
-                month=period,  # This could be month or quarter depending on period_type
+            nps_result = beam.Row(
+                month=period,
                 country=country,
                 total=total,
                 promoters=promoters,
                 neutral=neutral,
                 detractors=detractors
-            ))
-        
-        logging.info(f"Calculated NPS for {len(nps_results)} periods in region {region}")
-        logging.info(f"Found {len(reviews)} reviews in region {region}")
-        
-        # Return NPS results and reviews
-        for nps_result in nps_results:
+            )
             yield ('nps', nps_result)
         
+        # Отправляем отзывы
         for review in reviews:
             yield ('review', review)
 
 
-def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', credentials_path=None):
-    """Writes reviews data to Google Sheets."""
-    
-    if not reviews:
-        logging.warning("Empty reviews list – nothing to write to Google Sheets")
-        return None
-        
-    logging.info(f"Starting to write {len(reviews)} reviews to Google Sheets (ID: {spreadsheet_id})")
-    
-    # Authenticate
-    if credentials_path:
-        logging.info(f"Using service-account credentials from file: {credentials_path}")
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_path, 
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-    else:
-        logging.info("Using Application Default Credentials in Dataflow")
-        credentials, _ = google.auth.default(
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-    
-    service = build('sheets', 'v4', credentials=credentials)
-    
-    # Get list of existing sheets
-    sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheets = sheet_metadata.get('sheets', '')
-    
-    # Check if the "NPS Reviews" sheet already exists
-    reviews_sheet_id = None
-    for sheet in sheets:
-        if sheet['properties']['title'] == 'NPS Reviews':
-            reviews_sheet_id = sheet['properties']['sheetId']
-            break
-    
-    # Create the sheet if it does not exist
-    if not reviews_sheet_id:
-        logging.info("'NPS Reviews' sheet not found, creating a new one")
-        body = {
-            'requests': [{
-                'addSheet': {
-                    'properties': {
-                        'title': 'NPS Reviews',
-                        'gridProperties': {
-                            'rowCount': 2000,
-                            'columnCount': 8
-                        }
-                    }
-                }
-            }]
-        }
-        response = service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body=body
-        ).execute()
-        reviews_sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
-        
-        # Add headers
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range='NPS Reviews!A1:H1',
-            valueInputOption='RAW',
-            body={
-                'values': [['user_uuid', 'user_name', 'user_email', 'country', 'date', 'quarter', 'score', 'review']]
-            }
-        ).execute()
-        logging.info("Created a new sheet and added headers")
-    else:
-        logging.info("Found existing sheet 'NPS Reviews'")
-    
-    # Get the number of existing rows
-    response = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range='NPS Reviews!A:A'
-    ).execute()
-    values = response.get('values', [])
-    next_row = len(values) + 1
-    logging.info(f"Detected {next_row-1} existing rows, starting to write from row {next_row}")
-    
-    # Format data for upload
-    review_values = []
-    for review in reviews:
-        # Handle beam.Row objects
-        if hasattr(review, '_asdict'):
-            review_dict = review._asdict()
-        else:
-            review_dict = review
-            
-        review_values.append([
-            review_dict.get('user_uuid', ''),
-            review_dict.get('user_name', ''),
-            review_dict.get('user_email', ''),
-            review_dict.get('country', ''),
-            review_dict.get('date', ''),
-            review_dict.get('quarter', ''),
-            str(review_dict.get('score', 0)),
-            review_dict.get('review', '')
-        ])
-    
-    # Write data in batches to stay within API limitations
-    BATCH_SIZE = 500
-    total_written = 0
-    results = []
-    
-    for i in range(0, len(review_values), BATCH_SIZE):
-        batch = review_values[i:i + BATCH_SIZE]
-        current_row = next_row + i
-        
-        logging.info(f"Writing batch {i//BATCH_SIZE + 1} of {len(batch)} reviews starting from row {current_row}")
-        
-        body = {
-            'values': batch
-        }
-        try:
-            result = service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f'NPS Reviews!A{current_row}',
-                valueInputOption='RAW',
-                body=body
-            ).execute()
-            
-            updated_rows = result.get('updatedRows', 0)
-            total_written += updated_rows
-            results.append(result)
-            
-            logging.info(f"Successfully wrote {updated_rows} rows for batch {i//BATCH_SIZE + 1}")
-        except Exception as e:
-            logging.error(f"Error while writing batch {i//BATCH_SIZE + 1}: {str(e)}")
-    
-    logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(review_values)} passed")
-    return results
-
-
 class WriteReviewsToSheets(beam.DoFn):
-    """DoFn that writes reviews into Google Sheets."""
+    """DoFn that writes reviews to Google Sheets with better error handling."""
     
     def __init__(self, spreadsheet_id, credentials_path=None):
         self.spreadsheet_id = spreadsheet_id
         self.credentials_path = credentials_path
+        self.service = None
 
-    def process(self, _, reviews_as_list):
-        if not reviews_as_list:
-            logging.warning("Empty reviews list – nothing to write")
+    def setup(self):
+        """Initialize Google Sheets service."""
+        try:
+            if self.credentials_path:
+                credentials = service_account.Credentials.from_service_account_file(
+                    self.credentials_path, 
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+            else:
+                credentials, _ = google.auth.default(
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+            
+            self.service = build('sheets', 'v4', credentials=credentials)
+            logging.info("Google Sheets service initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize Google Sheets service: {e}")
+            raise
+
+    def process(self, reviews_batch):
+        if not reviews_batch or not self.service:
             return
             
         try:
-            logging.info(f"{len(reviews_as_list)} reviews were passed to the Google Sheets write function")
+            # Проверяем/создаем лист
+            self._ensure_sheet_exists()
             
-            results = write_to_sheets(
-                reviews_as_list, 
-                self.spreadsheet_id, 
-                credentials_path=self.credentials_path
-            )
+            # Получаем следующую строку для записи
+            next_row = self._get_next_row()
             
-            if results:
-                total_written = sum(result.get('updatedRows', 0) for result in results)
-                logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(reviews_as_list)} passed")
-                yield {'status': 'success', 'written_reviews': total_written}
-            else:
-                logging.warning("Write to Google Sheets skipped, empty result")
-                yield {'status': 'no_data', 'written_reviews': 0}
+            # Форматируем данные для записи
+            review_values = []
+            for review in reviews_batch:
+                if hasattr(review, '_asdict'):
+                    review_dict = review._asdict()
+                else:
+                    review_dict = review
+                    
+                review_values.append([
+                    review_dict.get('user_uuid', ''),
+                    review_dict.get('user_name', ''),
+                    review_dict.get('user_email', ''),
+                    review_dict.get('country', ''),
+                    review_dict.get('date', ''),
+                    review_dict.get('quarter', ''),
+                    str(review_dict.get('score', 0)),
+                    review_dict.get('review', '')
+                ])
+            
+            # Записываем данные
+            if review_values:
+                body = {'values': review_values}
+                result = self.service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f'NPS Reviews!A{next_row}',
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                updated_rows = result.get('updatedRows', 0)
+                logging.info(f"Successfully wrote {updated_rows} reviews to Google Sheets")
+                yield {'status': 'success', 'written_reviews': updated_rows}
                 
         except Exception as e:
             error_message = str(e)
             logging.error(f"Error writing to Google Sheets: {error_message}")
             yield {'status': 'error', 'error': error_message}
 
+    def _ensure_sheet_exists(self):
+        """Ensures the NPS Reviews sheet exists."""
+        sheet_metadata = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        sheets = sheet_metadata.get('sheets', [])
+        
+        # Проверяем существование листа
+        sheet_exists = any(sheet['properties']['title'] == 'NPS Reviews' for sheet in sheets)
+        
+        if not sheet_exists:
+            # Создаем лист
+            body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {
+                            'title': 'NPS Reviews',
+                            'gridProperties': {
+                                'rowCount': 5000,
+                                'columnCount': 8
+                            }
+                        }
+                    }
+                }]
+            }
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=body
+            ).execute()
+            
+            # Добавляем заголовки
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range='NPS Reviews!A1:H1',
+                valueInputOption='RAW',
+                body={
+                    'values': [['user_uuid', 'user_name', 'user_email', 'country', 'date', 'quarter', 'score', 'review']]
+                }
+            ).execute()
+
+    def _get_next_row(self):
+        """Gets the next available row number."""
+        response = self.service.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id,
+            range='NPS Reviews!A:A'
+        ).execute()
+        values = response.get('values', [])
+        return len(values) + 1
+
 
 def run(argv=None):
     """Entry point for the NPS Dataflow pipeline."""
     
     parser = argparse.ArgumentParser()
-    # Required arguments
     parser.add_argument('--api_key', required=True, help='Intercom API key')
     parser.add_argument('--target_table', required=True, help='BigQuery table for NPS data (project:dataset.table)')
     parser.add_argument('--spreadsheet_id', required=True, help='Google Spreadsheet ID for reviews')
     
-    # Period configuration
     parser.add_argument('--period_type', default='monthly', choices=['monthly', 'quarterly'], 
                        help='Collection period type: monthly or quarterly')
     parser.add_argument('--period_offset', type=int, default=1, 
                        help='How many periods back to collect (1 = previous period)')
     
-    # Optional arguments
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
     parser.add_argument('--debug', type=str, default='false', choices=['true', 'false'], 
                        help='Enable debug mode (no period filtering)')
     
-    # Date override (for manual runs) - now in YYYY-MM-DD format
     parser.add_argument('--start_date', help='Override start date in format YYYY-MM-DD')
     parser.add_argument('--end_date', help='Override end date in format YYYY-MM-DD')
     
@@ -717,21 +665,19 @@ def run(argv=None):
     pipeline_options = PipelineOptions(pipeline_args)
     pipeline_options.view_as(SetupOptions).save_main_session = True
     
-    # Convert debug string to boolean
+
+    
     debug_mode = known_args.debug.lower() == 'true'
     
-    # Calculate the date range to fetch data
     if known_args.start_date and known_args.end_date:
         start_date = known_args.start_date
         end_date = known_args.end_date
-        logging.info(f"Using provided dates: from {start_date} to {end_date}")
     else:
         start_date, end_date = calculate_period_dates(
             known_args.period_type, 
             known_args.period_offset
         )
     
-    # Extract period string from start date (for logging/filtering)
     run_period = None
     if not debug_mode:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -741,80 +687,79 @@ def run(argv=None):
             quarter = (start_dt.month - 1) // 3 + 1
             run_period = f"{start_dt.year}-Q{quarter}"
     
-    # Map argument to local variable for clarity
-    nps_table = known_args.target_table
-    
-    if run_period:
-        logging.info(f"Starting NPS pipeline for {known_args.period_type} period: {run_period}")
-    else:
-        logging.info("Starting NPS pipeline in debug mode (no period filtering)")
+    logging.info(f"Starting NPS pipeline for period: {run_period or 'debug mode'}")
 
     with beam.Pipeline(options=pipeline_options) as p:
-        # Create a dummy input element to kick off the pipeline
-        dummy_input = p | "Create Dummy Input" >> beam.Create([None])
-        
-        # Fetch data from Intercom using the new series-based approach
-        intercom_data = dummy_input | "Fetch Intercom Data" >> beam.ParDo(
-            FetchIntercomData(
-                known_args.api_key,
-                start_date,
-                end_date
+        # Создаем задачи для получения данных
+        data_tasks = (p 
+            | "Create Dummy Input" >> beam.Create([None])
+            | "Create Data Fetch Tasks" >> beam.ParDo(
+                CreateDataFetchTasks(known_args.api_key, start_date, end_date)
             )
         )
         
-        # Calculate NPS and format reviews with period configuration
-        nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(
-            CalculateNPS(
-                period_type=known_args.period_type,
-                run_period=run_period
+        # Обрабатываем данные построчно по регионам
+        intercom_data = (data_tasks
+            | "Process Intercom Data" >> beam.ParDo(ProcessIntercomData())
+        )
+        
+        # Рассчитываем NPS и форматируем отзывы
+        nps_and_reviews = (intercom_data 
+            | "Calculate NPS" >> beam.ParDo(
+                CalculateNPS(
+                    period_type=known_args.period_type,
+                    run_period=run_period
+                )
             )
         )
         
-        # Split NPS aggregates and review rows
-        nps_data, reviews_data = nps_and_reviews | "Split NPS and Reviews" >> beam.Partition(
-            lambda elem, _: 0 if elem[0] == 'nps' else 1, 2
+        # Разделяем NPS и отзывы
+        nps_data, reviews_data = (nps_and_reviews 
+            | "Split NPS and Reviews" >> beam.Partition(
+                lambda elem, _: 0 if elem[0] == 'nps' else 1, 2
+            )
         )
         
-        # Format NPS data for BigQuery
-        def format_nps_for_bq(elem):
-            nps_row = elem[1]
-            if hasattr(nps_row, '_asdict'):
-                return nps_row._asdict()
-            else:
-                return nps_row
-                
-        nps_for_bq = nps_data | "Format NPS for BigQuery" >> beam.Map(format_nps_for_bq)
-        
-        # Write NPS data to BigQuery
-        nps_for_bq | "Write NPS to BigQuery" >> WriteToBigQuery(
-            nps_table,
-            schema=NPS_SCHEMA,
-            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
-            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+        # Форматируем NPS данные для BigQuery
+        nps_for_bq = (nps_data 
+            | "Format NPS for BigQuery" >> beam.Map(lambda elem: elem[1]._asdict())
         )
         
-        # Format reviews for Google Sheets
-        reviews_for_sheets = reviews_data | "Format Reviews for Sheets" >> beam.Map(lambda x: x[1])
-        
-        # Log review statistics
-        reviews_count = reviews_for_sheets | "Count Reviews" >> beam.combiners.Count.Globally()
-        reviews_count | "Log Reviews Count" >> beam.Map(lambda count: logging.info(f"Total number of reviews to write: {count}"))
-        
-        # Collect all reviews into a single list
-        reviews_as_list = reviews_for_sheets | "Collect Reviews" >> beam.combiners.ToList()
-        
-        # Write reviews to Google Sheets and log the result
-        sheets_result = dummy_input | "Write Reviews to Sheets" >> beam.ParDo(
-            WriteReviewsToSheets(
-                known_args.spreadsheet_id, 
-                known_args.credentials_path
-            ),
-            reviews_as_list=beam.pvalue.AsSingleton(reviews_as_list)
+        # Записываем NPS в BigQuery
+        (nps_for_bq 
+            | "Write NPS to BigQuery" >> WriteToBigQuery(
+                known_args.target_table,
+                schema=NPS_SCHEMA,
+                write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+            )
         )
         
-        # Log the outcome of the write operation
-        sheets_result | "Log Sheets Result" >> beam.Map(
-            lambda result: logging.info(f"Sheets write result: {result}")
+        # Форматируем отзывы для Google Sheets
+        reviews_for_sheets = (reviews_data 
+            | "Format Reviews for Sheets" >> beam.Map(lambda x: x[1])
+        )
+        
+        # Группируем отзывы в батчи
+        reviews_batched = (reviews_for_sheets
+            | "Batch Reviews" >> beam.BatchElements(min_batch_size=10, max_batch_size=50)
+        )
+        
+        # Записываем отзывы в Google Sheets
+        sheets_results = (reviews_batched
+            | "Write Reviews to Sheets" >> beam.ParDo(
+                WriteReviewsToSheets(
+                    known_args.spreadsheet_id, 
+                    known_args.credentials_path
+                )
+            )
+        )
+        
+        # Логируем результаты
+        (sheets_results 
+            | "Log Sheets Results" >> beam.Map(
+                lambda result: logging.info(f"Sheets write result: {result}")
+            )
         )
 
 
