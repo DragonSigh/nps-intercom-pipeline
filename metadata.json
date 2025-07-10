@@ -1,6 +1,6 @@
 {
   "name": "Intercom NPS Pipeline",
-  "description": "Pipeline that fetches NPS data from Intercom Series, calculates metrics and saves to BigQuery and Google Sheets. Supports flexible period collection (monthly/quarterly).",
+  "description": "Advanced pipeline that fetches NPS data from Intercom Series with intelligent data structure detection, calculates metrics and saves to BigQuery and Google Sheets. Features enhanced diagnostics, flexible period collection (monthly/quarterly), and robust data parsing for various Intercom export formats.",
   "parameters": [
     {
       "name": "api_key",
@@ -78,7 +78,18 @@
     {
       "name": "debug",
       "label": "Debug Mode",
-      "helpText": "Enable debug mode to disable period filtering and process all available data",
+      "helpText": "Enable debug mode to disable period filtering and process all available data with enhanced logging",
+      "paramType": "TEXT",
+      "isOptional": true,
+      "defaultValue": "false",
+      "regexes": [
+        "^(true|false)$"
+      ]
+    },
+    {
+      "name": "debug_data_only",
+      "label": "Data Structure Debug Mode",
+      "helpText": "Run only data structure analysis without processing. Useful for understanding Intercom export format and troubleshooting data issues. Pipeline will exit after showing data structure.",
       "paramType": "TEXT",
       "isOptional": true,
       "defaultValue": "false",
