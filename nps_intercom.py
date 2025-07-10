@@ -22,23 +22,29 @@ from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions, 
 from apache_beam.io.gcp.bigquery import WriteToBigQuery
 
 
-# NPS column names for different languages
-NPS_COLUMNS = {
-    'RU': {
-        'score': "Пожалуйста, оцените вероятность того, что вы порекомендуете наш продукт друзьям и знакомым:",
-        'feedback': "Если Вам есть чем поделиться о своем опыте использования GoBe, мы будем рады обратной связи!"
+# Updated NPS survey configuration for series-based approach
+NPS_SURVEYS = {
+    'ENG': {
+        'series_name': 'Measure NPS® and follow-up_ENG',
+        'survey_name_pattern': r'Q\d+ NPS Survey$',  # Matches Q1 NPS Survey, Q2 NPS Survey, etc.
+        'nps_question': 'Thank you for choosing HEALBE! How likely is it that you would recommend HEALBE GoBe to a friend or colleague?',
+        'country_code': 'US'
     },
-    'US': {
-        'score': "How likely is it that you would recommend HEALBE GoBe to a friend or colleague",
-        'feedback': "If you have something to share about your GoBe experience, please feel free"
+    'RU': {
+        'series_name': 'Measure NPS® and follow-up_RU',
+        'survey_name_pattern': r'Q\d+ NPS Survey RU$',  # Matches Q1 NPS Survey RU, Q2 NPS Survey RU, etc.
+        'nps_question': 'Спасибо за ваш выбор HEALBE! Пожалуйста, оцените вероятность того, что вы порекомендуете наш продукт друзьям и знакомым',
+        'country_code': 'RU'
     },
     'JP': {
-        'score': "友人やご家族のメンバーにGoBeをお勧めしますか？",
-        'feedback': "GoBeのご利用の体験について共有したいご意見などがございましたら、是非ともお聞かせください。"
+        'series_name': 'Measure NPS® and follow-up_JP',
+        'survey_name_pattern': r'Q\d+ NPS Survey JP$',  # Matches Q1 NPS Survey JP, Q2 NPS Survey JP, etc.
+        'nps_question': 'GoBeデバイスを利用いただき、ありがとうございます。友人やご家族のメンバーにGoBeをお勧めしますか？',
+        'country_code': 'JP'
     }
 }
 
-# BigQuery schema definition
+# BigQuery schema definition (unchanged)
 NPS_SCHEMA = {
     'fields': [
         {'name': 'month', 'type': 'STRING'},
@@ -50,7 +56,7 @@ NPS_SCHEMA = {
     ]
 }
 
-# Typed tuples for output data
+# Typed tuples for output data (unchanged)
 class NPSData(typing.NamedTuple):
     month: str
     country: str
@@ -76,22 +82,63 @@ def iso_to_unix(iso_str):
     return int(dt.timestamp())
 
 
-def calculate_previous_month_dates():
-    """Calculates the start and end dates of the previous month."""
+def calculate_period_dates(period_type='monthly', period_offset=1):
+    """
+    Calculates the start and end dates for the specified period.
+    
+    Args:
+        period_type: 'monthly' or 'quarterly'
+        period_offset: How many periods back to go (1 = previous period, 2 = two periods back, etc.)
+    
+    Returns:
+        tuple: (start_date, end_date) in ISO format
+    """
     today = date.today()
-    # First day of the current month
-    first_of_this_month = today.replace(day=1)
-    # Last day of the previous month (the day before the first of the current month)
-    last_of_previous_month = first_of_this_month - timedelta(days=1)
-    # First day of the previous month
-    first_of_previous_month = last_of_previous_month.replace(day=1)
+    
+    if period_type == 'monthly':
+        # Calculate previous month(s)
+        current_month = today.replace(day=1)
+        for _ in range(period_offset):
+            current_month = (current_month - timedelta(days=1)).replace(day=1)
+        
+        start_date = current_month
+        # Last day of the target month
+        if current_month.month == 12:
+            end_date = current_month.replace(year=current_month.year + 1, month=1)
+        else:
+            end_date = current_month.replace(month=current_month.month + 1)
+            
+    elif period_type == 'quarterly':
+        # Calculate previous quarter(s)
+        current_quarter = ((today.month - 1) // 3) + 1
+        current_year = today.year
+        
+        for _ in range(period_offset):
+            current_quarter -= 1
+            if current_quarter < 1:
+                current_quarter = 4
+                current_year -= 1
+        
+        # Start of quarter
+        start_month = (current_quarter - 1) * 3 + 1
+        start_date = date(current_year, start_month, 1)
+        
+        # End of quarter
+        end_month = start_month + 2
+        if end_month > 12:
+            end_date = date(current_year + 1, end_month - 12 + 1, 1)
+        else:
+            end_date = date(current_year, end_month + 1, 1)
+    
+    else:
+        raise ValueError(f"Unsupported period_type: {period_type}")
     
     # Format dates in ISO8601 for the Intercom API
-    start_date = f"{first_of_previous_month.strftime('%Y-%m-%d')}T00:00:00Z"
-    end_date = f"{first_of_this_month.strftime('%Y-%m-%d')}T00:00:00Z"
+    start_date_iso = f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
+    end_date_iso = f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
     
-    logging.info(f"Requesting data for the previous month: from {start_date} to {end_date}")
-    return start_date, end_date
+    logging.info(f"Requesting data for {period_type} period: from {start_date_iso} to {end_date_iso}")
+    return start_date_iso, end_date_iso
 
 
 class IntercomService:
@@ -226,7 +273,7 @@ class IntercomService:
 
 
 class FetchIntercomData(beam.DoFn):
-    """DoFn that fetches raw Intercom data and processes it for all regions."""
+    """DoFn that fetches raw Intercom data and processes it for all regions using the new series structure."""
     
     def __init__(self, api_key, start_date, end_date):
         self.api_key = api_key
@@ -244,104 +291,74 @@ class FetchIntercomData(beam.DoFn):
         # Log the column names for diagnostics
         logging.info(f"Loaded columns: {list(data.columns)}")
         
-        # Safely determine the date range
-        if 'created_at' in data.columns:
-            try:
-                # Convert datetime values to strings so they can be logged safely
-                created_at_sample = data['created_at'].astype(str)
-                logging.info(f"Sample 'created_at' values: {created_at_sample.head(5).tolist()}")
-                
-                # Attempt to convert all dates to a unified format
-                if data['created_at'].dtype == 'object':  # string or mixed dtype
-                    logging.info("The 'created_at' column contains string or mixed data types")
-                else:
-                    min_date = data['created_at'].min()
-                    max_date = data['created_at'].max()
-                    logging.info(f"Date range in data: {min_date} - {max_date}")
-            except Exception as e:
-                logging.warning(f"Could not determine date range: {str(e)}")
-        
-        # Check that the expected NPS columns exist for each region
-        for region in ['RU', 'JP', 'US']:
-            score_column = NPS_COLUMNS.get(region, NPS_COLUMNS['US'])['score']
-            feedback_column = NPS_COLUMNS.get(region, NPS_COLUMNS['US'])['feedback']
+        # Process data for each region/language
+        for lang_code, config in NPS_SURVEYS.items():
+            logging.info(f"Processing data for language: {lang_code}")
             
-            logging.info(f"Processing data for region {region}. Score column: '{score_column}'")
+            # Filter data for this specific series
+            series_data = data[data.get('series_name', '') == config['series_name']] if 'series_name' in data.columns else data
             
-            # Process rows
+            if series_data.empty:
+                logging.warning(f"No data found for series: {config['series_name']}")
+                continue
+            
+            # Filter for NPS surveys within the series
+            nps_surveys = series_data[
+                series_data.get('survey_name', '').str.match(config['survey_name_pattern'], na=False)
+            ] if 'survey_name' in series_data.columns else series_data
+            
+            if nps_surveys.empty:
+                logging.warning(f"No NPS surveys found for pattern: {config['survey_name_pattern']}")
+                continue
+            
+            logging.info(f"Found {len(nps_surveys)} NPS survey responses for {lang_code}")
+            
             results = []
             
-            # Verify that required columns are present
-            if score_column not in data.columns and feedback_column not in data.columns:
-                logging.warning(f"Required columns not found for region {region}")
-                continue
-                
-            for _, row in data.iterrows():
+            for _, row in nps_surveys.iterrows():
                 score = None
                 feedback = None
                 
-                # Extract NPS score, handling list representations
-                if score_column in row and pd.notnull(row[score_column]):
-                    score_value = row[score_column]
-                    
-                    # Parse stringified lists/dicts into native Python objects
-                    if isinstance(score_value, str) and ('[' in score_value or '{' in score_value):
-                        try:
-                            parsed_value = ast.literal_eval(score_value)
-                            if isinstance(parsed_value, list) and len(parsed_value) > 0:
-                                score_value = parsed_value[0]
+                # Extract NPS score - look for the score in various possible columns
+                score_columns = ['answer', 'rating', 'score', 'response']
+                for col in score_columns:
+                    if col in row and pd.notnull(row[col]):
+                        score_value = row[col]
+                        
+                        # Handle different score formats
+                        if isinstance(score_value, str):
+                            # Try to extract numeric value
+                            if score_value.isdigit():
+                                score = int(score_value)
                             else:
-                                score_value = parsed_value
-                        except Exception:
-                            pass
-                    
-                    # Handle the score value
-                    if isinstance(score_value, str):
-                        # For Russian version: "0 - Not likely" or "10 - Definitely recommend"
-                        if " - " in score_value:
-                            score = int(score_value.split(" - ")[0])
-                        else:
-                            # Try to extract the numeric part
-                            match = re.search(r'\d+', score_value)
-                            if match:
-                                score = int(match.group())
-                    else:
-                        # Already a numeric value
-                        try:
-                            score = int(float(score_value))
-                        except (ValueError, TypeError):
-                            score = None
+                                # Look for number in the string
+                                match = re.search(r'\d+', score_value)
+                                if match:
+                                    score = int(match.group())
+                        elif isinstance(score_value, (int, float)):
+                            score = int(score_value)
+                        
+                        if score is not None:
+                            break
                 
-                # Extract review text, handling list representations
-                if feedback_column in row and pd.notnull(row[feedback_column]):
-                    feedback_value = row[feedback_column]
-                    
-                    # Parse stringified lists/dicts into native Python objects
-                    if isinstance(feedback_value, str) and ('[' in feedback_value or '{' in feedback_value):
-                        try:
-                            parsed_value = ast.literal_eval(feedback_value)
-                            if isinstance(parsed_value, list) and len(parsed_value) > 0:
-                                feedback_value = parsed_value[0]
-                            else:
-                                feedback_value = parsed_value
-                        except Exception:
-                            pass
-                    
-                    feedback = str(feedback_value)
+                # Extract feedback from conversation messages or follow-up responses
+                feedback_columns = ['body', 'message', 'feedback', 'comment', 'follow_up']
+                for col in feedback_columns:
+                    if col in row and pd.notnull(row[col]):
+                        feedback_value = row[col]
+                        if isinstance(feedback_value, str) and feedback_value.strip():
+                            feedback = feedback_value.strip()
+                            break
                 
-                # Extract user identifier and name
-                user_id = row.get('user_id', None)
-                if user_id is None:
-                    user_id = row.get('user_external_id', None)
-                
-                user_name = row.get('name', '')
-                user_email = row.get('email', '')
+                # Extract user information
+                user_id = row.get('user_id') or row.get('user_external_id') or row.get('contact_id')
+                user_name = row.get('name', '') or row.get('user_name', '')
+                user_email = row.get('email', '') or row.get('user_email', '')
                 
                 # Extract creation date
-                created_at = row.get('created_at', None)
+                created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
                 if created_at:
                     try:
-                        # Convert to datetime
                         if isinstance(created_at, str):
                             created_at = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
                         elif isinstance(created_at, (int, float)):
@@ -351,36 +368,40 @@ class FetchIntercomData(beam.DoFn):
                 else:
                     created_at = datetime.now()
                 
-                # Append an entry only if there is a score or a non-empty review
-                if score is not None or (feedback is not None and feedback.strip()):
+                # Add result if we have a score or feedback
+                if score is not None or (feedback and feedback.strip()):
                     results.append({
-                        'user_uuid': user_id,
-                        'user_name': user_name,
-                        'user_email': user_email,
-                        'country': region,
+                        'user_uuid': str(user_id) if user_id else "",
+                        'user_name': str(user_name) if user_name else "",
+                        'user_email': str(user_email) if user_email else "",
+                        'country': config['country_code'],
                         'date': created_at,
                         'score': score,
                         'review': feedback
                     })
             
-            logging.info(f"Processed {len(results)} records for region {region}")
-            yield {
-                'region': region,
-                'results': results
-            }
+            logging.info(f"Processed {len(results)} records for {lang_code}")
+            
+            if results:
+                yield {
+                    'region': config['country_code'],
+                    'results': results
+                }
 
 
 class CalculateNPS(beam.DoFn):
     """DoFn that calculates the NPS metric and formats reviews."""
     
-    def __init__(self, run_month=None):
+    def __init__(self, period_type='monthly', run_period=None):
         """
-        Initializes the transform with an optional specific month filter.
+        Initializes the transform with period configuration.
 
         Args:
-            run_month: String in the form 'YYYY-MM' specifying the month being processed.
+            period_type: 'monthly' or 'quarterly'
+            run_period: String specifying the period being processed (e.g., 'YYYY-MM' or 'YYYY-Q1')
         """
-        self.run_month = run_month
+        self.period_type = period_type
+        self.run_period = run_period
         
     def process(self, element):
         region = element['region']
@@ -392,13 +413,13 @@ class CalculateNPS(beam.DoFn):
         
         logging.info(f"Received {len(results)} results to process for region {region}")
         
-        # Group data by month for NPS calculation
-        month_data = {}
+        # Group data by period for NPS calculation
+        period_data = {}
         
         # Prepare reviews
         reviews = []
-        all_months = set()
-        nps_months = set()
+        all_periods = set()
+        nps_periods = set()
         
         for result in results:
             user_uuid = result.get('user_uuid')
@@ -409,27 +430,35 @@ class CalculateNPS(beam.DoFn):
             score = result.get('score')
             review = result.get('review')
             
-            # Determine month string for NPS grouping
-            month_str = date_obj.strftime('%Y-%m')
-            all_months.add(month_str)
+            # Determine period string for NPS grouping
+            if self.period_type == 'monthly':
+                period_str = date_obj.strftime('%Y-%m')
+            elif self.period_type == 'quarterly':
+                quarter = (date_obj.month - 1) // 3 + 1
+                period_str = f"{date_obj.year}-Q{quarter}"
+            else:
+                period_str = date_obj.strftime('%Y-%m')  # Default to monthly
             
-            # Debug: log the month and skip filtering if needed
-            if self.run_month and month_str != self.run_month:
-                logging.info(f"Found data for month {month_str}, expected month: {self.run_month}")
+            all_periods.add(period_str)
+            
+            # Filter by specific period if provided
+            if self.run_period and period_str != self.run_period:
+                logging.debug(f"Skipping data for period {period_str}, expected: {self.run_period}")
+                continue
             
             # Add data for NPS calculation (only if there is a score)
             if score is not None:
-                if month_str not in month_data:
-                    month_data[month_str] = {
+                if period_str not in period_data:
+                    period_data[period_str] = {
                         'scores': [],
                         'country': country
                     }
-                month_data[month_str]['scores'].append(score)
-                nps_months.add(month_str)
+                period_data[period_str]['scores'].append(score)
+                nps_periods.add(period_str)
             
             # Add review (even if text is empty, but there is a score)
             if review or score is not None:
-                # Determine quarter
+                # Determine quarter for review data
                 year = date_obj.year
                 quarter = (date_obj.month - 1) // 3 + 1
                 quarter_str = f"{year} Q{quarter}"
@@ -458,18 +487,14 @@ class CalculateNPS(beam.DoFn):
                     review=review_str
                 )
                 reviews.append(review_data)
-                
-                # Debug: print the first few reviews and show an example of a non-empty review
-                if len(reviews) <= 3 or (len(reviews) <= 10 and review_str):
-                    logging.info(f"Review #{len(reviews)}: name={user_name_str}, score={score_int}, review='{review_str[:50]}...' (user: {user_uuid_str[:8]})")
         
         logging.info(f"Prepared {len(reviews)} reviews for region {region}")
-        logging.info(f"Months found: {sorted(list(all_months))}")
-        logging.info(f"Months with NPS scores: {sorted(list(nps_months))}")
+        logging.info(f"Periods found: {sorted(list(all_periods))}")
+        logging.info(f"Periods with NPS scores: {sorted(list(nps_periods))}")
         
-        # Calculate NPS for each month
+        # Calculate NPS for each period
         nps_results = []
-        for month, data in month_data.items():
+        for period, data in period_data.items():
             scores = data['scores']
             country = data['country']
             
@@ -481,12 +506,9 @@ class CalculateNPS(beam.DoFn):
             total = len(scores)
             neutral = total - promoters - detractors
             
-            # Calculate NPS
-            nps_score = (promoters - detractors) / total * 100 if total > 0 else 0
-            
-            # Create NPS record without the nps_score field
+            # Create NPS record
             nps_results.append(NPSData(
-                month=month,
+                month=period,  # This could be month or quarter depending on period_type
                 country=country,
                 total=total,
                 promoters=promoters,
@@ -494,14 +516,13 @@ class CalculateNPS(beam.DoFn):
                 detractors=detractors
             ))
         
-        logging.info(f"Calculated NPS for {len(nps_results)} months in region {region}")
+        logging.info(f"Calculated NPS for {len(nps_results)} periods in region {region}")
         logging.info(f"Found {len(reviews)} reviews in region {region}")
         
         # Return NPS results and reviews
         for nps_result in nps_results:
             yield ('nps', nps_result)
         
-        # Always return all reviews, regardless of month
         for review in reviews:
             yield ('review', review)
 
@@ -550,8 +571,8 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
                     'properties': {
                         'title': 'NPS Reviews',
                         'gridProperties': {
-                            'rowCount': 2000,  # Increase the initial row count
-                            'columnCount': 8   # Increase the number of columns for the new fields
+                            'rowCount': 2000,
+                            'columnCount': 8
                         }
                     }
                 }
@@ -600,7 +621,7 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
         ])
     
     # Write data in batches to stay within API limitations
-    BATCH_SIZE = 500  # Google Sheets API request-size limit
+    BATCH_SIZE = 500
     total_written = 0
     results = []
     
@@ -629,7 +650,7 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
         except Exception as e:
             logging.error(f"Error while writing batch {i//BATCH_SIZE + 1}: {str(e)}")
     
-    logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(reviews_as_list)} passed")
+    logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(review_values)} passed")
     return results
 
 
@@ -674,17 +695,20 @@ def run(argv=None):
     parser = argparse.ArgumentParser()
     # Required arguments
     parser.add_argument('--api_key', required=True, help='Intercom API key')
-    # Use --target_table instead of --nps_table for template compatibility
     parser.add_argument('--target_table', required=True, help='BigQuery table for NPS data (project:dataset.table)')
     parser.add_argument('--spreadsheet_id', required=True, help='Google Spreadsheet ID for reviews')
+    
+    # Period configuration
+    parser.add_argument('--period_type', default='monthly', choices=['monthly', 'quarterly'], 
+                       help='Collection period type: monthly or quarterly')
+    parser.add_argument('--period_offset', type=int, default=1, 
+                       help='How many periods back to collect (1 = previous period)')
+    
     # Optional arguments
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode (skip date filtering)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode (no period filtering)')
     
-    # Extra parameters that might appear in logs or template but are unused
-    parser.add_argument('--postgres_host', help='Not used, for compatibility only')
-    parser.add_argument('--postgres_port', type=int, help='Not used, for compatibility only')
-    parser.add_argument('--postgres_database', help='Not used, for compatibility only')
+    # Date override (for manual runs)
     parser.add_argument('--start_date', help='Override start date in ISO format (YYYY-MM-DDThh:mm:ssZ)')
     parser.add_argument('--end_date', help='Override end date in ISO format (YYYY-MM-DDThh:mm:ssZ)')
     
@@ -698,18 +722,28 @@ def run(argv=None):
         end_date = known_args.end_date
         logging.info(f"Using provided dates: from {start_date} to {end_date}")
     else:
-        start_date, end_date = calculate_previous_month_dates()
+        start_date, end_date = calculate_period_dates(
+            known_args.period_type, 
+            known_args.period_offset
+        )
+    
+    # Extract period string from start date (for logging/filtering)
+    run_period = None
+    if not known_args.debug:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
+        if known_args.period_type == 'monthly':
+            run_period = start_dt.strftime('%Y-%m')
+        elif known_args.period_type == 'quarterly':
+            quarter = (start_dt.month - 1) // 3 + 1
+            run_period = f"{start_dt.year}-Q{quarter}"
     
     # Map argument to local variable for clarity
     nps_table = known_args.target_table
     
-    # Extract month string from start date (for logging/filtering)
-    run_month = None if known_args.debug else datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ").strftime('%Y-%m')
-    
-    if run_month:
-        logging.info(f"Starting NPS pipeline for month: {run_month}")
+    if run_period:
+        logging.info(f"Starting NPS pipeline for {known_args.period_type} period: {run_period}")
     else:
-        logging.info("Starting NPS pipeline in debug mode (no month filtering)")
+        logging.info("Starting NPS pipeline in debug mode (no period filtering)")
 
     with beam.Pipeline(options=pipeline_options) as p:
         # Register coders for custom NamedTuple types
@@ -719,7 +753,7 @@ def run(argv=None):
         # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])
         
-        # Fetch data from Intercom
+        # Fetch data from Intercom using the new series-based approach
         intercom_data = dummy_input | "Fetch Intercom Data" >> beam.ParDo(
             FetchIntercomData(
                 known_args.api_key,
@@ -728,8 +762,13 @@ def run(argv=None):
             )
         )
         
-        # Calculate NPS and format reviews with optional month filtering
-        nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(CalculateNPS(run_month=run_month))
+        # Calculate NPS and format reviews with period configuration
+        nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(
+            CalculateNPS(
+                period_type=known_args.period_type,
+                run_period=run_period
+            )
+        )
         
         # Split NPS aggregates and review rows
         nps_data, reviews_data = nps_and_reviews | "Split NPS and Reviews" >> beam.Partition(

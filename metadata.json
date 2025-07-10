@@ -1,6 +1,6 @@
 {
   "name": "Intercom NPS Pipeline",
-  "description": "Pipeline that fetches NPS data from Intercom, calculates metrics and saves to BigQuery and Google Sheets",
+  "description": "Pipeline that fetches NPS data from Intercom Series, calculates metrics and saves to BigQuery and Google Sheets. Supports flexible period collection (monthly/quarterly).",
   "parameters": [
     {
       "name": "api_key",
@@ -27,18 +27,46 @@
       "isOptional": false
     },
     {
-      "name": "start_date",
-      "label": "Start Date",
-      "helpText": "Start date in ISO format (YYYY-MM-DDThh:mm:ssZ). Optional, defaults to first day of previous month.",
+      "name": "period_type",
+      "label": "Collection Period Type",
+      "helpText": "Type of collection period: 'monthly' for monthly collection or 'quarterly' for quarterly collection",
       "paramType": "TEXT",
-      "isOptional": true
+      "isOptional": true,
+      "defaultValue": "monthly",
+      "regexes": [
+        "^(monthly|quarterly)$"
+      ]
+    },
+    {
+      "name": "period_offset",
+      "label": "Period Offset",
+      "helpText": "How many periods back to collect data (1 = previous period, 2 = two periods back, etc.)",
+      "paramType": "TEXT",
+      "isOptional": true,
+      "defaultValue": "1",
+      "regexes": [
+        "^[1-9]\\d*$"
+      ]
+    },
+    {
+      "name": "start_date",
+      "label": "Start Date (Override)",
+      "helpText": "Override start date in ISO format (YYYY-MM-DDThh:mm:ssZ). If provided, period_type and period_offset are ignored.",
+      "paramType": "TEXT",
+      "isOptional": true,
+      "regexes": [
+        "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+      ]
     },
     {
       "name": "end_date",
-      "label": "End Date",
-      "helpText": "End date in ISO format (YYYY-MM-DDThh:mm:ssZ). Optional, defaults to first day of current month.",
+      "label": "End Date (Override)",
+      "helpText": "Override end date in ISO format (YYYY-MM-DDThh:mm:ssZ). Must be provided together with start_date.",
       "paramType": "TEXT",
-      "isOptional": true
+      "isOptional": true,
+      "regexes": [
+        "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+      ]
     },
     {
       "name": "credentials_path",
@@ -46,6 +74,17 @@
       "helpText": "Path to service account credentials file for accessing Google Sheets. If not provided, Application Default Credentials will be used.",
       "paramType": "TEXT",
       "isOptional": true
+    },
+    {
+      "name": "debug",
+      "label": "Debug Mode",
+      "helpText": "Enable debug mode to disable period filtering and process all available data",
+      "paramType": "TEXT",
+      "isOptional": true,
+      "defaultValue": "false",
+      "regexes": [
+        "^(true|false)$"
+      ]
     }
   ],
   "defaultEnvironment": {
