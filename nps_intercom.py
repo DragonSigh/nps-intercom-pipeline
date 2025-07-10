@@ -871,8 +871,8 @@ def run(argv=None):
     
     # Optional arguments
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode (no period filtering)')
-    parser.add_argument('--debug_data_only', action='store_true', help='Only run data structure debug (no pipeline)')
+    parser.add_argument('--debug', type=str, default='false', help='Enable debug mode (no period filtering)')
+    parser.add_argument('--debug_data_only', type=str, default='false', help='Only run data structure debug (no pipeline)')
     
     # Date override (for manual runs)
     parser.add_argument('--start_date', help='Override start date in ISO format (YYYY-MM-DDThh:mm:ssZ)')
@@ -892,7 +892,7 @@ def run(argv=None):
         )
     
     # Debug data only mode
-    if known_args.debug_data_only:
+    if known_args.debug_data_only.lower() == 'true':
         logging.info("Running in debug_data_only mode - will exit after data analysis")
         intercom_service = IntercomService(known_args.api_key)
         data = intercom_service.get_nps_data(start_date, end_date)
@@ -918,7 +918,7 @@ def run(argv=None):
     
     # Extract period string from start date (for logging/filtering)
     run_period = None
-    if not known_args.debug:
+    if known_args.debug.lower() != 'true':
         start_dt = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
         if known_args.period_type == 'monthly':
             run_period = start_dt.strftime('%Y-%m')
@@ -947,7 +947,7 @@ def run(argv=None):
                 known_args.api_key,
                 start_date,
                 end_date,
-                debug_mode=known_args.debug
+                debug_mode=(known_args.debug.lower() == 'true')
             )
         )
         
