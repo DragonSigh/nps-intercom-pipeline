@@ -1,0 +1,95 @@
+# Byte-compiled / optimized / DLL files
+git__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+*.whl
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Unit testing / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+.hypothesis/
+.pytype/
+.mypy_cache/
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Translations
+*.mo
+*.pot
+
+# Documentation builds
+/docs/_build/
+
+# PyBuilder
+/target/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Other IDE/editor folders
+*.swp
+*~
+.vim/
+
+# macOS
+.DS_Store
+
+# Windows thumbnail cache files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+*.pid
+
+# Secret/environment files
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Docker runtime files
+*.container
+
+# Ignore compiled protos or generated files (Apache Beam pipelines often generate temp files)
+*.avro
+*.parquet
+
+# Ignore any local configuration overrides
+config.local.*
+
+# General git directory safety
+.git/ 

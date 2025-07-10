@@ -22,7 +22,7 @@ from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions, 
 from apache_beam.io.gcp.bigquery import WriteToBigQuery
 
 
-# Названия колонок NPS для разных языков
+# NPS column names for different languages
 NPS_COLUMNS = {
     'RU': {
         'score': "Пожалуйста, оцените вероятность того, что вы порекомендуете наш продукт друзьям и знакомым:",
@@ -38,7 +38,7 @@ NPS_COLUMNS = {
     }
 }
 
-# Схемы для BigQuery
+# BigQuery schema definition
 NPS_SCHEMA = {
     'fields': [
         {'name': 'month', 'type': 'STRING'},
@@ -50,7 +50,7 @@ NPS_SCHEMA = {
     ]
 }
 
-# Типы данных для вывода
+# Typed tuples for output data
 class NPSData(typing.NamedTuple):
     month: str
     country: str
@@ -71,31 +71,31 @@ class ReviewData(typing.NamedTuple):
 
 
 def iso_to_unix(iso_str):
-    """Преобразует ISO8601 в Unix timestamp"""
+    """Converts an ISO8601 string into a Unix timestamp."""
     dt = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ")
     return int(dt.timestamp())
 
 
 def calculate_previous_month_dates():
-    """Вычисляет дату начала и конца предыдущего месяца"""
+    """Calculates the start and end dates of the previous month."""
     today = date.today()
-    # Первое число текущего месяца
+    # First day of the current month
     first_of_this_month = today.replace(day=1)
-    # Последний день предыдущего месяца (день перед первым числом этого месяца)
+    # Last day of the previous month (the day before the first of the current month)
     last_of_previous_month = first_of_this_month - timedelta(days=1)
-    # Первое число предыдущего месяца
+    # First day of the previous month
     first_of_previous_month = last_of_previous_month.replace(day=1)
     
-    # Форматируем даты в ISO8601 для Intercom API
+    # Format dates in ISO8601 for the Intercom API
     start_date = f"{first_of_previous_month.strftime('%Y-%m-%d')}T00:00:00Z"
     end_date = f"{first_of_this_month.strftime('%Y-%m-%d')}T00:00:00Z"
     
-    logging.info(f"Запрашиваем данные за предыдущий месяц: с {start_date} по {end_date}")
+    logging.info(f"Requesting data for the previous month: from {start_date} to {end_date}")
     return start_date, end_date
 
 
 class IntercomService:
-    """Сервис для работы с Intercom API"""
+    """Service wrapper for Intercom API interactions."""
     
     def __init__(self, api_key):
         self.api_key = api_key
@@ -108,7 +108,7 @@ class IntercomService:
         self.base_url = "https://api.intercom.io"
 
     def create_export_job(self, start_date, end_date):
-        """Создает задание экспорта с обработкой ошибок"""
+        """Creates an export job with basic error handling."""
         endpoint = f"{self.base_url}/export/content/data"
         payload = {
             "created_at_after": iso_to_unix(start_date),
@@ -119,25 +119,25 @@ class IntercomService:
             result = response.json()
             if 'job_identifier' in result:
                 return result['job_identifier']
-            logging.error("В ответе нет job_identifier.")
+            logging.error("No 'job_identifier' found in the response.")
         elif response.status_code == 429:
-            logging.error("Ошибка: Достигнут лимит активных заданий (1 на workspace)")
+            logging.error("Error: Active job limit reached (1 per workspace)")
         else:
-            logging.error(f"HTTP ошибка {response.status_code}: {response.text}")
+            logging.error(f"HTTP error {response.status_code}: {response.text}")
         return None
 
     def check_export_status(self, job_id):
-        """Проверяет статус задания"""
+        """Checks the status of an export job."""
         endpoint = f"{self.base_url}/export/content/data/{job_id}"
         response = requests.get(endpoint, headers=self.headers)
         if response.status_code == 200:
             return response.json()
         else:
-            logging.error(f"Ошибка при проверке статуса задания: {response.status_code}")
+            logging.error(f"Error while checking job status: {response.status_code}")
             return None
 
     def download_export_results(self, download_url):
-        """Скачивает и распаковывает gzipped CSV или ZIP-архив экспорта"""
+        """Downloads and extracts a gzipped CSV or ZIP archive produced by the export job."""
         download_headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/octet-stream"
@@ -146,7 +146,7 @@ class IntercomService:
         if response.status_code == 200:
             content = response.content
 
-            # Проверяем сигнатуру файла
+            # Detect file signature
             if content[:2] == b'\x1f\x8b':  # GZ
                 with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
                     df = pd.read_csv(gz)
@@ -161,72 +161,72 @@ class IntercomService:
                     if dfs:
                         df = pd.concat(dfs, ignore_index=True)
                         return df
-                    logging.error("В ZIP-архиве нет CSV-файлов.")
+                    logging.error("No CSV files found inside the ZIP archive.")
                     return None
             else:
-                # Возможно это просто CSV файл
+                # It might simply be a plain CSV file
                 try:
                     df = pd.read_csv(io.BytesIO(content))
                     return df
                 except:
-                    logging.error("Неизвестный формат файла экспорта.")
+                    logging.error("Unknown export file format.")
                     return None
         else:
-            logging.error(f"Ошибка при загрузке результатов: {response.status_code}")
+            logging.error(f"Error while downloading results: {response.status_code}")
             return None
 
     def get_nps_data(self, start_date, end_date):
-        """Загружает данные NPS из Intercom"""
-        logging.info(f"Создание задания на экспорт данных с {start_date} по {end_date}...")
+        """Fetches NPS data from Intercom."""
+        logging.info(f"Creating export job for data from {start_date} to {end_date}...")
 
-        # Создаем задание на экспорт
+        # Create the export job
         job_id = self.create_export_job(start_date, end_date)
         if not job_id:
-            logging.error(f"Ошибка создания задания.")
+            logging.error("Failed to create export job.")
             return None
 
-        logging.info(f"Задание создано. ID: {job_id}")
+        logging.info(f"Export job created. ID: {job_id}")
 
-        # Ожидаем завершения задания
-        max_attempts = 30  # Максимальное количество попыток проверки статуса
+        # Wait until the export job is finished
+        max_attempts = 30  # Maximum number of status-check attempts
         for attempt in range(max_attempts):
             status_info = self.check_export_status(job_id)
             if not status_info:
-                logging.error("Задание не найдено или удалено")
+                logging.error("Export job not found or was deleted")
                 return None
 
             state = status_info.get('status', 'unknown')
-            logging.info(f"Статус: {state.upper()}")
+            logging.info(f"Status: {state.upper()}")
 
             if state == 'completed':
                 download_url = status_info.get('download_url')
                 if not download_url:
-                    logging.error("Ошибка: отсутствует download_url")
+                    logging.error("Error: 'download_url' is missing in the response")
                     return None
 
-                logging.info("Загрузка и обработка данных...")
+                logging.info("Downloading and processing data...")
                 df = self.download_export_results(download_url)
                 
                 if df is not None:
-                    logging.info(f"Загружено {len(df)} строк")
+                    logging.info(f"Loaded {len(df)} rows")
                     return df
                 else:
-                    logging.error(f"Ошибка загрузки данных")
+                    logging.error("Failed to load data")
                     return None
             
             elif state in ('failed', 'no_data'):
-                logging.error(f"Экспорт завершился с ошибкой: {status_info.get('message', 'не указана')}")
+                logging.error(f"Export failed: {status_info.get('message', 'unspecified')}")
                 return None
             
-            # Ждем перед следующей проверкой
+            # Sleep before the next status check
             time.sleep(20)
         
-        logging.error(f"Превышено максимальное количество попыток ({max_attempts}) для проверки статуса экспорта")
+        logging.error(f"Exceeded maximum attempts ({max_attempts}) to check export status")
         return None
 
 
 class FetchIntercomData(beam.DoFn):
-    """DoFn для получения данных из Intercom API и обработки их для всех регионов"""
+    """DoFn that fetches raw Intercom data and processes it for all regions."""
     
     def __init__(self, api_key, start_date, end_date):
         self.api_key = api_key
@@ -238,53 +238,53 @@ class FetchIntercomData(beam.DoFn):
         data = intercom_service.get_nps_data(self.start_date, self.end_date)
         
         if data is None:
-            logging.warning("Не удалось получить данные из Intercom")
+            logging.warning("Failed to retrieve data from Intercom")
             return
         
-        # Логируем название колонок для диагностики
-        logging.info(f"Загруженные колонки: {list(data.columns)}")
+        # Log the column names for diagnostics
+        logging.info(f"Loaded columns: {list(data.columns)}")
         
-        # Безопасно извлекаем диапазон дат
+        # Safely determine the date range
         if 'created_at' in data.columns:
             try:
-                # Преобразуем datetime значения к строкам для безопасного вывода
+                # Convert datetime values to strings so they can be logged safely
                 created_at_sample = data['created_at'].astype(str)
-                logging.info(f"Примеры значений created_at: {created_at_sample.head(5).tolist()}")
+                logging.info(f"Sample 'created_at' values: {created_at_sample.head(5).tolist()}")
                 
-                # Попытка преобразовать все даты к единому формату
-                if data['created_at'].dtype == 'object':  # если строковый или смешанный тип
-                    logging.info("Колонка created_at содержит строковые или смешанные типы данных")
+                # Attempt to convert all dates to a unified format
+                if data['created_at'].dtype == 'object':  # string or mixed dtype
+                    logging.info("The 'created_at' column contains string or mixed data types")
                 else:
                     min_date = data['created_at'].min()
                     max_date = data['created_at'].max()
-                    logging.info(f"Диапазон дат в данных: {min_date} - {max_date}")
+                    logging.info(f"Date range in data: {min_date} - {max_date}")
             except Exception as e:
-                logging.warning(f"Не удалось определить диапазон дат: {str(e)}")
+                logging.warning(f"Could not determine date range: {str(e)}")
         
-        # Проверяем наличие данных NPS для каждого региона
+        # Check that the expected NPS columns exist for each region
         for region in ['RU', 'JP', 'US']:
             score_column = NPS_COLUMNS.get(region, NPS_COLUMNS['US'])['score']
             feedback_column = NPS_COLUMNS.get(region, NPS_COLUMNS['US'])['feedback']
             
-            logging.info(f"Обработка данных для региона {region}. Колонка с оценками: '{score_column}'")
+            logging.info(f"Processing data for region {region}. Score column: '{score_column}'")
             
-            # Обрабатываем данные
+            # Process rows
             results = []
             
-            # Проверяем наличие колонок
+            # Verify that required columns are present
             if score_column not in data.columns and feedback_column not in data.columns:
-                logging.warning(f"Для региона {region} не найдены требуемые колонки")
+                logging.warning(f"Required columns not found for region {region}")
                 continue
                 
             for _, row in data.iterrows():
                 score = None
                 feedback = None
                 
-                # Извлекаем оценку NPS с обработкой списков
+                # Extract NPS score, handling list representations
                 if score_column in row and pd.notnull(row[score_column]):
                     score_value = row[score_column]
                     
-                    # Преобразуем строковые представления списков в объекты Python
+                    # Parse stringified lists/dicts into native Python objects
                     if isinstance(score_value, str) and ('[' in score_value or '{' in score_value):
                         try:
                             parsed_value = ast.literal_eval(score_value)
@@ -292,31 +292,31 @@ class FetchIntercomData(beam.DoFn):
                                 score_value = parsed_value[0]
                             else:
                                 score_value = parsed_value
-                        except:
+                        except Exception:
                             pass
                     
-                    # Обработка значения оценки
+                    # Handle the score value
                     if isinstance(score_value, str):
-                        # Для русской версии: "0 - Мало вероятно" или "10 - Точно порекомендую"
+                        # For Russian version: "0 - Not likely" or "10 - Definitely recommend"
                         if " - " in score_value:
                             score = int(score_value.split(" - ")[0])
                         else:
-                            # Пытаемся извлечь числовое значение
+                            # Try to extract the numeric part
                             match = re.search(r'\d+', score_value)
                             if match:
                                 score = int(match.group())
                     else:
-                        # Если уже числовое значение
+                        # Already a numeric value
                         try:
                             score = int(float(score_value))
                         except (ValueError, TypeError):
                             score = None
                 
-                # Извлекаем текст отзыва с обработкой списков
+                # Extract review text, handling list representations
                 if feedback_column in row and pd.notnull(row[feedback_column]):
                     feedback_value = row[feedback_column]
                     
-                    # Преобразуем строковые представления списков в объекты Python
+                    # Parse stringified lists/dicts into native Python objects
                     if isinstance(feedback_value, str) and ('[' in feedback_value or '{' in feedback_value):
                         try:
                             parsed_value = ast.literal_eval(feedback_value)
@@ -324,12 +324,12 @@ class FetchIntercomData(beam.DoFn):
                                 feedback_value = parsed_value[0]
                             else:
                                 feedback_value = parsed_value
-                        except:
+                        except Exception:
                             pass
                     
                     feedback = str(feedback_value)
                 
-                # Извлекаем идентификатор пользователя и имя
+                # Extract user identifier and name
                 user_id = row.get('user_id', None)
                 if user_id is None:
                     user_id = row.get('user_external_id', None)
@@ -337,11 +337,11 @@ class FetchIntercomData(beam.DoFn):
                 user_name = row.get('name', '')
                 user_email = row.get('email', '')
                 
-                # Извлекаем дату создания
+                # Extract creation date
                 created_at = row.get('created_at', None)
                 if created_at:
                     try:
-                        # Преобразуем в datetime
+                        # Convert to datetime
                         if isinstance(created_at, str):
                             created_at = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
                         elif isinstance(created_at, (int, float)):
@@ -351,7 +351,7 @@ class FetchIntercomData(beam.DoFn):
                 else:
                     created_at = datetime.now()
                 
-                # Добавляем запись только если есть оценка или отзыв
+                # Append an entry only if there is a score or a non-empty review
                 if score is not None or (feedback is not None and feedback.strip()):
                     results.append({
                         'user_uuid': user_id,
@@ -363,7 +363,7 @@ class FetchIntercomData(beam.DoFn):
                         'review': feedback
                     })
             
-            logging.info(f"Обработано {len(results)} записей для региона {region}")
+            logging.info(f"Processed {len(results)} records for region {region}")
             yield {
                 'region': region,
                 'results': results
@@ -371,14 +371,14 @@ class FetchIntercomData(beam.DoFn):
 
 
 class CalculateNPS(beam.DoFn):
-    """DoFn для расчета NPS и форматирования отзывов"""
+    """DoFn that calculates the NPS metric and formats reviews."""
     
     def __init__(self, run_month=None):
         """
-        Инициализирует обработчик с опциональным указанием конкретного месяца
-        
+        Initializes the transform with an optional specific month filter.
+
         Args:
-            run_month: Строка в формате 'YYYY-MM', указывающая месяц, за который обрабатываются данные
+            run_month: String in the form 'YYYY-MM' specifying the month being processed.
         """
         self.run_month = run_month
         
@@ -387,15 +387,15 @@ class CalculateNPS(beam.DoFn):
         results = element['results']
         
         if not results:
-            logging.warning(f"Нет данных для обработки в регионе {region}")
+            logging.warning(f"No data to process for region {region}")
             return
         
-        logging.info(f"Получено {len(results)} результатов для обработки в регионе {region}")
+        logging.info(f"Received {len(results)} results to process for region {region}")
         
-        # Группируем данные по месяцу для расчета NPS
+        # Group data by month for NPS calculation
         month_data = {}
         
-        # Подготавливаем отзывы
+        # Prepare reviews
         reviews = []
         all_months = set()
         nps_months = set()
@@ -409,15 +409,15 @@ class CalculateNPS(beam.DoFn):
             score = result.get('score')
             review = result.get('review')
             
-            # Определяем месяц для группировки NPS
+            # Determine month string for NPS grouping
             month_str = date_obj.strftime('%Y-%m')
             all_months.add(month_str)
             
-            # СТАЛО: логирование месяца и пропуск фильтрации для отладки
+            # Debug: log the month and skip filtering if needed
             if self.run_month and month_str != self.run_month:
-                logging.info(f"Найдены данные за месяц {month_str}, ожидаемый месяц: {self.run_month}")
+                logging.info(f"Found data for month {month_str}, expected month: {self.run_month}")
             
-            # Добавляем данные для расчета NPS (только если есть оценка)
+            # Add data for NPS calculation (only if there is a score)
             if score is not None:
                 if month_str not in month_data:
                     month_data[month_str] = {
@@ -427,24 +427,24 @@ class CalculateNPS(beam.DoFn):
                 month_data[month_str]['scores'].append(score)
                 nps_months.add(month_str)
             
-            # Добавляем отзыв (даже если текст пустой, но есть оценка)
+            # Add review (even if text is empty, but there is a score)
             if review or score is not None:
-                # Определяем квартал
+                # Determine quarter
                 year = date_obj.year
                 quarter = (date_obj.month - 1) // 3 + 1
                 quarter_str = f"{year} Q{quarter}"
                 
-                # Безопасно преобразуем данные к строке
+                # Safely convert data to string
                 user_uuid_str = str(user_uuid) if user_uuid else ""
                 user_name_str = str(user_name) if user_name else ""
                 user_email_str = str(user_email) if user_email else ""
                 review_str = str(review) if review else ""
                 
-                # Безопасно преобразуем score к целому числу
+                # Safely convert score to integer
                 try:
                     score_int = int(score) if score is not None else 0
                 except (ValueError, TypeError):
-                    logging.warning(f"Не удалось преобразовать оценку '{score}' к целому числу, используем 0")
+                    logging.warning(f"Could not convert score '{score}' to int, defaulting to 0")
                     score_int = 0
                 
                 review_data = ReviewData(
@@ -459,15 +459,15 @@ class CalculateNPS(beam.DoFn):
                 )
                 reviews.append(review_data)
                 
-                # Для отладки: выводим первые 3 отзыва и показываем пример непустого отзыва
+                # Debug: print the first few reviews and show an example of a non-empty review
                 if len(reviews) <= 3 or (len(reviews) <= 10 and review_str):
-                    logging.info(f"Отзыв #{len(reviews)}: name={user_name_str}, score={score_int}, review='{review_str[:50]}...' (user: {user_uuid_str[:8]})")
+                    logging.info(f"Review #{len(reviews)}: name={user_name_str}, score={score_int}, review='{review_str[:50]}...' (user: {user_uuid_str[:8]})")
         
-        logging.info(f"Подготовлено {len(reviews)} отзывов для региона {region}")
-        logging.info(f"Найдены данные за месяцы: {sorted(list(all_months))}")
-        logging.info(f"Месяцы с NPS оценками: {sorted(list(nps_months))}")
+        logging.info(f"Prepared {len(reviews)} reviews for region {region}")
+        logging.info(f"Months found: {sorted(list(all_months))}")
+        logging.info(f"Months with NPS scores: {sorted(list(nps_months))}")
         
-        # Рассчитываем NPS для каждого месяца
+        # Calculate NPS for each month
         nps_results = []
         for month, data in month_data.items():
             scores = data['scores']
@@ -481,10 +481,10 @@ class CalculateNPS(beam.DoFn):
             total = len(scores)
             neutral = total - promoters - detractors
             
-            # Расчет NPS
+            # Calculate NPS
             nps_score = (promoters - detractors) / total * 100 if total > 0 else 0
             
-            # Создаем запись NPS без поля nps_score
+            # Create NPS record without the nps_score field
             nps_results.append(NPSData(
                 month=month,
                 country=country,
@@ -494,64 +494,64 @@ class CalculateNPS(beam.DoFn):
                 detractors=detractors
             ))
         
-        logging.info(f"Рассчитано NPS для {len(nps_results)} месяцев в регионе {region}")
-        logging.info(f"Найдено {len(reviews)} отзывов в регионе {region}")
+        logging.info(f"Calculated NPS for {len(nps_results)} months in region {region}")
+        logging.info(f"Found {len(reviews)} reviews in region {region}")
         
-        # Возвращаем результаты NPS и отзывы
+        # Return NPS results and reviews
         for nps_result in nps_results:
             yield ('nps', nps_result)
         
-        # Всегда возвращаем все отзывы, независимо от месяца
+        # Always return all reviews, regardless of month
         for review in reviews:
             yield ('review', review)
 
 
 def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', credentials_path=None):
-    """Записывает отзывы в Google Sheets"""
+    """Writes reviews data to Google Sheets."""
     
     if not reviews:
-        logging.warning("Пустой список отзывов, нечего записывать в Google Sheets")
+        logging.warning("Empty reviews list – nothing to write to Google Sheets")
         return None
         
-    logging.info(f"Начинаем запись {len(reviews)} отзывов в Google Sheets (ID: {spreadsheet_id})")
+    logging.info(f"Starting to write {len(reviews)} reviews to Google Sheets (ID: {spreadsheet_id})")
     
-    # Аутентификация
+    # Authenticate
     if credentials_path:
-        logging.info(f"Используем учетные данные из файла: {credentials_path}")
+        logging.info(f"Using service-account credentials from file: {credentials_path}")
         credentials = service_account.Credentials.from_service_account_file(
             credentials_path, 
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
     else:
-        logging.info("Используем учетные данные по умолчанию для Dataflow")
+        logging.info("Using Application Default Credentials in Dataflow")
         credentials, _ = google.auth.default(
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
     
     service = build('sheets', 'v4', credentials=credentials)
     
-    # Получаем список текущих листов
+    # Get list of existing sheets
     sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     sheets = sheet_metadata.get('sheets', '')
     
-    # Проверяем наличие листа "NPS Reviews"
+    # Check if the "NPS Reviews" sheet already exists
     reviews_sheet_id = None
     for sheet in sheets:
         if sheet['properties']['title'] == 'NPS Reviews':
             reviews_sheet_id = sheet['properties']['sheetId']
             break
     
-    # Если лист не существует, создаем его
+    # Create the sheet if it does not exist
     if not reviews_sheet_id:
-        logging.info("Лист 'NPS Reviews' не найден, создаем новый")
+        logging.info("'NPS Reviews' sheet not found, creating a new one")
         body = {
             'requests': [{
                 'addSheet': {
                     'properties': {
                         'title': 'NPS Reviews',
                         'gridProperties': {
-                            'rowCount': 2000,  # Увеличиваем начальный размер
-                            'columnCount': 8   # Увеличиваем количество колонок для новых полей
+                            'rowCount': 2000,  # Increase the initial row count
+                            'columnCount': 8   # Increase the number of columns for the new fields
                         }
                     }
                 }
@@ -563,7 +563,7 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
         ).execute()
         reviews_sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
         
-        # Добавляем заголовки
+        # Add headers
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range='NPS Reviews!A1:H1',
@@ -572,20 +572,20 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
                 'values': [['user_uuid', 'user_name', 'user_email', 'country', 'date', 'quarter', 'score', 'review']]
             }
         ).execute()
-        logging.info("Создан новый лист и добавлены заголовки")
+        logging.info("Created a new sheet and added headers")
     else:
-        logging.info("Найден существующий лист 'NPS Reviews'")
+        logging.info("Found existing sheet 'NPS Reviews'")
     
-    # Получаем количество существующих строк
+    # Get the number of existing rows
     response = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range='NPS Reviews!A:A'
     ).execute()
     values = response.get('values', [])
     next_row = len(values) + 1
-    logging.info(f"Обнаружено {next_row-1} строк в таблице, начинаем запись с {next_row} строки")
+    logging.info(f"Detected {next_row-1} existing rows, starting to write from row {next_row}")
     
-    # Форматируем данные для загрузки
+    # Format data for upload
     review_values = []
     for review in reviews:
         review_values.append([
@@ -599,8 +599,8 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
             review.review
         ])
     
-    # Записываем данные с разбивкой на пакеты для обхода ограничений API
-    BATCH_SIZE = 500  # Google Sheets API имеет ограничения на размер запроса
+    # Write data in batches to stay within API limitations
+    BATCH_SIZE = 500  # Google Sheets API request-size limit
     total_written = 0
     results = []
     
@@ -608,7 +608,7 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
         batch = review_values[i:i + BATCH_SIZE]
         current_row = next_row + i
         
-        logging.info(f"Записываем пакет {i//BATCH_SIZE + 1} из {len(batch)} отзывов начиная со строки {current_row}")
+        logging.info(f"Writing batch {i//BATCH_SIZE + 1} of {len(batch)} reviews starting from row {current_row}")
         
         body = {
             'values': batch
@@ -625,16 +625,16 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
             total_written += updated_rows
             results.append(result)
             
-            logging.info(f"Успешно записано {updated_rows} строк в пакете {i//BATCH_SIZE + 1}")
+            logging.info(f"Successfully wrote {updated_rows} rows for batch {i//BATCH_SIZE + 1}")
         except Exception as e:
-            logging.error(f"Ошибка при записи пакета {i//BATCH_SIZE + 1}: {str(e)}")
+            logging.error(f"Error while writing batch {i//BATCH_SIZE + 1}: {str(e)}")
     
-    logging.info(f"Всего записано {total_written} отзывов в Google Sheets")
+    logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(reviews_as_list)} passed")
     return results
 
 
 class WriteReviewsToSheets(beam.DoFn):
-    """DoFn для записи отзывов в Google Sheets"""
+    """DoFn that writes reviews into Google Sheets."""
     
     def __init__(self, spreadsheet_id, credentials_path=None):
         self.spreadsheet_id = spreadsheet_id
@@ -642,11 +642,11 @@ class WriteReviewsToSheets(beam.DoFn):
 
     def process(self, _, reviews_as_list):
         if not reviews_as_list:
-            logging.warning("Пустой список отзывов, нечего записывать")
+            logging.warning("Empty reviews list – nothing to write")
             return
             
         try:
-            logging.info(f"Передано {len(reviews_as_list)} отзывов в функцию записи в Google Sheets")
+            logging.info(f"{len(reviews_as_list)} reviews were passed to the Google Sheets write function")
             
             results = write_to_sheets(
                 reviews_as_list, 
@@ -656,32 +656,32 @@ class WriteReviewsToSheets(beam.DoFn):
             
             if results:
                 total_written = sum(result.get('updatedRows', 0) for result in results)
-                logging.info(f"Итого записано {total_written} отзывов в Google Sheets из {len(reviews_as_list)} переданных")
+                logging.info(f"Total of {total_written} reviews written to Google Sheets out of {len(reviews_as_list)} passed")
                 yield {'status': 'success', 'written_reviews': total_written}
             else:
-                logging.warning("Запись в Google Sheets не выполнена, результат пустой")
+                logging.warning("Write to Google Sheets skipped, empty result")
                 yield {'status': 'no_data', 'written_reviews': 0}
                 
         except Exception as e:
             error_message = str(e)
-            logging.error(f"Ошибка при записи в Google Sheets: {error_message}")
+            logging.error(f"Error writing to Google Sheets: {error_message}")
             yield {'status': 'error', 'error': error_message}
 
 
 def run(argv=None):
-    """Основная функция пайплайна"""
+    """Entry point for the NPS Dataflow pipeline."""
     
     parser = argparse.ArgumentParser()
-    # Основные параметры
+    # Required arguments
     parser.add_argument('--api_key', required=True, help='Intercom API key')
-    # Используем target_table вместо nps_table для совместимости с метаданными
+    # Use --target_table instead of --nps_table for template compatibility
     parser.add_argument('--target_table', required=True, help='BigQuery table for NPS data (project:dataset.table)')
     parser.add_argument('--spreadsheet_id', required=True, help='Google Spreadsheet ID for reviews')
-    # Опциональные параметры
+    # Optional arguments
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode (skip date filtering)')
     
-    # Добавляем параметры, которые могут быть в логах и template
+    # Extra parameters that might appear in logs or template but are unused
     parser.add_argument('--postgres_host', help='Not used, for compatibility only')
     parser.add_argument('--postgres_port', type=int, help='Not used, for compatibility only')
     parser.add_argument('--postgres_database', help='Not used, for compatibility only')
@@ -692,34 +692,34 @@ def run(argv=None):
     pipeline_options = PipelineOptions(pipeline_args)
     pipeline_options.view_as(SetupOptions).save_main_session = True
     
-    # Вычисляем даты для выборки данных
+    # Calculate the date range to fetch data
     if known_args.start_date and known_args.end_date:
         start_date = known_args.start_date
         end_date = known_args.end_date
-        logging.info(f"Используются переданные даты: с {start_date} по {end_date}")
+        logging.info(f"Using provided dates: from {start_date} to {end_date}")
     else:
         start_date, end_date = calculate_previous_month_dates()
     
-    # Используем параметр target_table для совместимости
+    # Map argument to local variable for clarity
     nps_table = known_args.target_table
     
-    # Извлекаем месяц из даты начала для логирования и фильтрации
+    # Extract month string from start date (for logging/filtering)
     run_month = None if known_args.debug else datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ").strftime('%Y-%m')
     
     if run_month:
-        logging.info(f"Запуск пайплайна NPS для месяца: {run_month}")
+        logging.info(f"Starting NPS pipeline for month: {run_month}")
     else:
-        logging.info("Запуск пайплайна NPS в режиме отладки (без фильтрации по месяцу)")
+        logging.info("Starting NPS pipeline in debug mode (no month filtering)")
 
     with beam.Pipeline(options=pipeline_options) as p:
-        # Регистрируем кодеры для пользовательских типов
+        # Register coders for custom NamedTuple types
         beam.coders.registry.register_coder(NPSData, beam.coders.RowCoder)
         beam.coders.registry.register_coder(ReviewData, beam.coders.RowCoder)
         
-        # Создаем исходные данные - один элемент для запуска загрузки данных
+        # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])
         
-        # Получаем данные из Intercom
+        # Fetch data from Intercom
         intercom_data = dummy_input | "Fetch Intercom Data" >> beam.ParDo(
             FetchIntercomData(
                 known_args.api_key,
@@ -728,18 +728,18 @@ def run(argv=None):
             )
         )
         
-        # Рассчитываем NPS и форматируем отзывы с фильтрацией по месяцу
+        # Calculate NPS and format reviews with optional month filtering
         nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(CalculateNPS(run_month=run_month))
         
-        # Разделяем NPS данные и отзывы
+        # Split NPS aggregates and review rows
         nps_data, reviews_data = nps_and_reviews | "Split NPS and Reviews" >> beam.Partition(
             lambda elem, _: 0 if elem[0] == 'nps' else 1, 2
         )
         
-        # Форматируем данные NPS для записи в BigQuery
+        # Format NPS data for BigQuery
         nps_for_bq = nps_data | "Format NPS for BigQuery" >> beam.Map(lambda x: x[1]._asdict())
         
-        # Записываем NPS данные в BigQuery
+        # Write NPS data to BigQuery
         nps_for_bq | "Write NPS to BigQuery" >> WriteToBigQuery(
             nps_table,
             schema=NPS_SCHEMA,
@@ -747,17 +747,17 @@ def run(argv=None):
             create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
         )
         
-        # Форматируем отзывы для записи в Google Sheets
+        # Format reviews for Google Sheets
         reviews_for_sheets = reviews_data | "Format Reviews for Sheets" >> beam.Map(lambda x: x[1])
         
-        # Логируем статистику отзывов
+        # Log review statistics
         reviews_count = reviews_for_sheets | "Count Reviews" >> beam.combiners.Count.Globally()
-        reviews_count | "Log Reviews Count" >> beam.Map(lambda count: logging.info(f"Общее количество отзывов для записи: {count}"))
+        reviews_count | "Log Reviews Count" >> beam.Map(lambda count: logging.info(f"Total number of reviews to write: {count}"))
         
-        # Собираем все отзывы в один список
+        # Collect all reviews into a single list
         reviews_as_list = reviews_for_sheets | "Collect Reviews" >> beam.combiners.ToList()
         
-        # Записываем отзывы в Google Sheets и логируем результат
+        # Write reviews to Google Sheets and log the result
         sheets_result = dummy_input | "Write Reviews to Sheets" >> beam.ParDo(
             WriteReviewsToSheets(
                 known_args.spreadsheet_id, 
@@ -766,9 +766,9 @@ def run(argv=None):
             reviews_as_list=beam.pvalue.AsSingleton(reviews_as_list)
         )
         
-        # Логируем результат записи
+        # Log the outcome of the write operation
         sheets_result | "Log Sheets Result" >> beam.Map(
-            lambda result: logging.info(f"Результат записи в Sheets: {result}")
+            lambda result: logging.info(f"Sheets write result: {result}")
         )
 
 

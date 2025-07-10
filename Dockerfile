@@ -7,13 +7,13 @@ COPY requirements.txt .
 COPY setup.py .
 COPY nps_intercom.py .
 
-# Установка зависимостей с обновлением pip
+# Install Python dependencies and upgrade pip
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Таймзона для корректной работы с датами
+# Set timezone for correct date handling
 ENV TZ=Europe/Moscow
 
-# Конфигурация пути для запуска
+# Entrypoint configuration for Flex Template launcher
 ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/nps_intercom.py"
 ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
