@@ -16,7 +16,7 @@
       "paramType": "TEXT",
       "isOptional": false,
       "regexes": [
-        "^[^:]+:[^.]+\\.[^.]+$"
+        "^[a-zA-Z0-9_-]+:[a-zA-Z0-9_]+\\.[a-zA-Z0-9_]+$"
       ]
     },
     {
@@ -45,27 +45,27 @@
       "isOptional": true,
       "defaultValue": "1",
       "regexes": [
-        "^[1-9]\\d*$"
+        "^[1-9][0-9]*$"
       ]
     },
     {
       "name": "start_date",
       "label": "Start Date (Override)",
-      "helpText": "Override start date in ISO format (YYYY-MM-DDThh:mm:ssZ). If provided, period_type and period_offset are ignored.",
+      "helpText": "Override start date in format YYYY-MM-DD. If provided, period_type and period_offset are ignored.",
       "paramType": "TEXT",
       "isOptional": true,
       "regexes": [
-        "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
       ]
     },
     {
       "name": "end_date",
       "label": "End Date (Override)",
-      "helpText": "Override end date in ISO format (YYYY-MM-DDThh:mm:ssZ). Must be provided together with start_date.",
+      "helpText": "Override end date in format YYYY-MM-DD. Must be provided together with start_date.",
       "paramType": "TEXT",
       "isOptional": true,
       "regexes": [
-        "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
       ]
     },
     {

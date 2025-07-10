@@ -44,7 +44,7 @@ NPS_SURVEYS = {
     }
 }
 
-# BigQuery schema definition (unchanged)
+# BigQuery schema definition
 NPS_SCHEMA = {
     'fields': [
         {'name': 'month', 'type': 'STRING'},
@@ -56,29 +56,19 @@ NPS_SCHEMA = {
     ]
 }
 
-# Typed tuples for output data (unchanged)
-class NPSData(typing.NamedTuple):
-    month: str
-    country: str
-    total: int
-    promoters: int
-    neutral: int
-    detractors: int
 
-class ReviewData(typing.NamedTuple):
-    user_uuid: str
-    user_name: str
-    user_email: str
-    country: str
-    date: str
-    quarter: str
-    score: int
-    review: str
+def date_to_unix(date_str):
+    """Converts a YYYY-MM-DD date string to Unix timestamp."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return int(dt.timestamp())
 
 
-def iso_to_unix(iso_str):
-    """Converts an ISO8601 string into a Unix timestamp."""
-    dt = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ")
+def datetime_to_unix(datetime_str):
+    """Converts a datetime string to Unix timestamp."""
+    if 'T' in datetime_str:
+        dt = datetime.strptime(datetime_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+    else:
+        dt = datetime.strptime(datetime_str, "%Y-%m-%d")
     return int(dt.timestamp())
 
 
@@ -91,7 +81,7 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
         period_offset: How many periods back to go (1 = previous period, 2 = two periods back, etc.)
     
     Returns:
-        tuple: (start_date, end_date) in ISO format
+        tuple: (start_date, end_date) in YYYY-MM-DD format
     """
     today = date.today()
     
@@ -133,12 +123,12 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
     else:
         raise ValueError(f"Unsupported period_type: {period_type}")
     
-    # Format dates in ISO8601 for the Intercom API
-    start_date_iso = f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z"
-    end_date_iso = f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
+    # Format dates in YYYY-MM-DD format
+    start_date_str = start_date.strftime('%Y-%m-%d')
+    end_date_str = end_date.strftime('%Y-%m-%d')
     
-    logging.info(f"Requesting data for {period_type} period: from {start_date_iso} to {end_date_iso}")
-    return start_date_iso, end_date_iso
+    logging.info(f"Requesting data for {period_type} period: from {start_date_str} to {end_date_str}")
+    return start_date_str, end_date_str
 
 
 class IntercomService:
@@ -158,8 +148,8 @@ class IntercomService:
         """Creates an export job with basic error handling."""
         endpoint = f"{self.base_url}/export/content/data"
         payload = {
-            "created_at_after": iso_to_unix(start_date),
-            "created_at_before": iso_to_unix(end_date)
+            "created_at_after": date_to_unix(start_date),
+            "created_at_before": date_to_unix(end_date)
         }
         response = requests.post(endpoint, headers=self.headers, json=payload)
         if response.status_code == 200:
@@ -360,10 +350,14 @@ class FetchIntercomData(beam.DoFn):
                 if created_at:
                     try:
                         if isinstance(created_at, str):
-                            created_at = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+                            if 'T' in created_at:
+                                created_at = datetime.strptime(created_at.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                            else:
+                                created_at = datetime.strptime(created_at, "%Y-%m-%d")
                         elif isinstance(created_at, (int, float)):
                             created_at = datetime.fromtimestamp(created_at)
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Could not parse date '{created_at}': {e}")
                         created_at = datetime.now()
                 else:
                     created_at = datetime.now()
@@ -476,7 +470,7 @@ class CalculateNPS(beam.DoFn):
                     logging.warning(f"Could not convert score '{score}' to int, defaulting to 0")
                     score_int = 0
                 
-                review_data = ReviewData(
+                review_data = beam.Row(
                     user_uuid=user_uuid_str,
                     user_name=user_name_str,
                     user_email=user_email_str,
@@ -507,7 +501,7 @@ class CalculateNPS(beam.DoFn):
             neutral = total - promoters - detractors
             
             # Create NPS record
-            nps_results.append(NPSData(
+            nps_results.append(beam.Row(
                 month=period,  # This could be month or quarter depending on period_type
                 country=country,
                 total=total,
@@ -609,15 +603,21 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
     # Format data for upload
     review_values = []
     for review in reviews:
+        # Handle beam.Row objects
+        if hasattr(review, '_asdict'):
+            review_dict = review._asdict()
+        else:
+            review_dict = review
+            
         review_values.append([
-            review.user_uuid,
-            review.user_name,
-            review.user_email,
-            review.country,
-            review.date,
-            review.quarter,
-            str(review.score),
-            review.review
+            review_dict.get('user_uuid', ''),
+            review_dict.get('user_name', ''),
+            review_dict.get('user_email', ''),
+            review_dict.get('country', ''),
+            review_dict.get('date', ''),
+            review_dict.get('quarter', ''),
+            str(review_dict.get('score', 0)),
+            review_dict.get('review', '')
         ])
     
     # Write data in batches to stay within API limitations
@@ -706,15 +706,19 @@ def run(argv=None):
     
     # Optional arguments
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode (no period filtering)')
+    parser.add_argument('--debug', type=str, default='false', choices=['true', 'false'], 
+                       help='Enable debug mode (no period filtering)')
     
-    # Date override (for manual runs)
-    parser.add_argument('--start_date', help='Override start date in ISO format (YYYY-MM-DDThh:mm:ssZ)')
-    parser.add_argument('--end_date', help='Override end date in ISO format (YYYY-MM-DDThh:mm:ssZ)')
+    # Date override (for manual runs) - now in YYYY-MM-DD format
+    parser.add_argument('--start_date', help='Override start date in format YYYY-MM-DD')
+    parser.add_argument('--end_date', help='Override end date in format YYYY-MM-DD')
     
     known_args, pipeline_args = parser.parse_known_args(argv)
     pipeline_options = PipelineOptions(pipeline_args)
     pipeline_options.view_as(SetupOptions).save_main_session = True
+    
+    # Convert debug string to boolean
+    debug_mode = known_args.debug.lower() == 'true'
     
     # Calculate the date range to fetch data
     if known_args.start_date and known_args.end_date:
@@ -729,8 +733,8 @@ def run(argv=None):
     
     # Extract period string from start date (for logging/filtering)
     run_period = None
-    if not known_args.debug:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
+    if not debug_mode:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         if known_args.period_type == 'monthly':
             run_period = start_dt.strftime('%Y-%m')
         elif known_args.period_type == 'quarterly':
@@ -746,10 +750,6 @@ def run(argv=None):
         logging.info("Starting NPS pipeline in debug mode (no period filtering)")
 
     with beam.Pipeline(options=pipeline_options) as p:
-        # Register coders for custom NamedTuple types
-        beam.coders.registry.register_coder(NPSData, beam.coders.RowCoder)
-        beam.coders.registry.register_coder(ReviewData, beam.coders.RowCoder)
-        
         # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])
         
@@ -776,7 +776,14 @@ def run(argv=None):
         )
         
         # Format NPS data for BigQuery
-        nps_for_bq = nps_data | "Format NPS for BigQuery" >> beam.Map(lambda x: x[1]._asdict())
+        def format_nps_for_bq(elem):
+            nps_row = elem[1]
+            if hasattr(nps_row, '_asdict'):
+                return nps_row._asdict()
+            else:
+                return nps_row
+                
+        nps_for_bq = nps_data | "Format NPS for BigQuery" >> beam.Map(format_nps_for_bq)
         
         # Write NPS data to BigQuery
         nps_for_bq | "Write NPS to BigQuery" >> WriteToBigQuery(

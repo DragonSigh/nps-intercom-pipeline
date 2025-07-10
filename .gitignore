@@ -1,5 +1,5 @@
 # Byte-compiled / optimized / DLL files
-git__pycache__/
+__pycache__/
 *.py[cod]
 *$py.class
 *.pyo
@@ -92,4 +92,4 @@ Desktop.ini
 config.local.*
 
 # General git directory safety
-.git/ 
+.git/
