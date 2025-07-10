@@ -275,10 +275,11 @@ class IntercomService:
 class FetchIntercomData(beam.DoFn):
     """DoFn that fetches raw Intercom data and processes it for all regions using the new series structure."""
     
-    def __init__(self, api_key, start_date, end_date):
+    def __init__(self, api_key, start_date, end_date, debug_mode=False):
         self.api_key = api_key
         self.start_date = start_date
         self.end_date = end_date
+        self.debug_mode = debug_mode
         
     def process(self, _):
         intercom_service = IntercomService(self.api_key)
@@ -291,57 +292,22 @@ class FetchIntercomData(beam.DoFn):
         # Log the column names for diagnostics
         logging.info(f"Loaded columns: {list(data.columns)}")
         
-        # ДОБАВЛЕННАЯ ДИАГНОСТИКА: Проверим уникальные значения ключевых колонок
-        self._log_data_structure(data)
-        
-        # ВРЕМЕННЫЙ ОТЛАДОЧНЫЙ КОД - покажем примеры данных
-        logging.info("=== ОТЛАДКА: Первые 3 строки данных ===")
-        if not data.empty:
-            for i, (idx, row) in enumerate(data.head(3).iterrows()):
-                # Показываем только ключевые колонки для краткости
-                key_cols = [col for col in row.index if any(word in col.lower() for word in 
-                           ['content', 'title', 'series', 'survey', 'response', 'answer', 'question'])]
-                if key_cols:
-                    key_data = {col: row[col] for col in key_cols if pd.notnull(row[col])}
-                    logging.info(f"Строка {i} (ключевые колонки): {key_data}")
-        
-        # Поиск данных NPS по содержанию вопроса как запасной вариант
-        nps_questions = [
-            "How likely is it that you would recommend HEALBE GoBe",
-            "Пожалуйста, оцените вероятность того, что вы порекомендуете",
-            "友人やご家族のメンバーにGoBeをお勧めしますか"
-        ]
-        
-        fallback_results = []
-        for question_part in nps_questions:
-            # Ищем во всех текстовых колонках
-            for col in data.columns:
-                if data[col].dtype == 'object':  # Текстовые колонки
-                    matches = data[data[col].str.contains(question_part, na=False, case=False)]
-                    if not matches.empty:
-                        logging.info(f"Найдено {len(matches)} совпадений по '{question_part}' в колонке '{col}'")
-                        fallback_results.extend(matches.to_dict('records'))
-        
-        if fallback_results:
-            logging.info(f"Запасной поиск: найдено {len(fallback_results)} потенциальных NPS записей")
+        # Enhanced debugging if enabled
+        if self.debug_mode:
+            self._log_data_structure(data)
         
         # Process data for each region/language
         for lang_code, config in NPS_SURVEYS.items():
             logging.info(f"Processing data for language: {lang_code}")
             
-            # ИСПРАВЛЕНИЕ 1: Более гибкий поиск series
+            # Find series data with enhanced logic
             series_data = self._find_series_data(data, config, lang_code)
             
             if series_data.empty:
                 logging.warning(f"No data found for series: {config['series_name']}")
-                # Попробуем использовать данные из запасного поиска
-                if fallback_results:
-                    logging.info(f"Trying fallback data for {lang_code}")
-                    series_data = pd.DataFrame(fallback_results)
-                else:
-                    continue
+                continue
             
-            # ИСПРАВЛЕНИЕ 2: Более гибкий поиск NPS опросов
+            # Find NPS surveys within the series
             nps_surveys = self._find_nps_surveys(series_data, config, lang_code)
             
             if nps_surveys.empty:
@@ -353,7 +319,7 @@ class FetchIntercomData(beam.DoFn):
             results = []
             
             for _, row in nps_surveys.iterrows():
-                # ИСПРАВЛЕНИЕ 3: Улучшенная обработка оценок и отзывов
+                # Extract NPS score and feedback
                 score, feedback = self._extract_nps_data(row, config, lang_code)
                 
                 # Extract user information
@@ -385,179 +351,211 @@ class FetchIntercomData(beam.DoFn):
                 }
 
     def _log_data_structure(self, data):
-        """Логирует структуру данных для диагностики"""
-        logging.info("=== ДИАГНОСТИКА СТРУКТУРЫ ДАННЫХ ===")
-        
-        # Проверим колонки, связанные с series
-        series_columns = [col for col in data.columns if 'series' in col.lower()]
-        logging.info(f"Series-related columns: {series_columns}")
-        
-        if series_columns:
-            for col in series_columns[:3]:  # Первые 3 колонки
-                unique_values = data[col].dropna().unique()[:10]  # Первые 10 значений
-                logging.info(f"Column '{col}' sample values: {list(unique_values)}")
-        
-        # Проверим колонки, связанные с опросами
-        survey_columns = [col for col in data.columns if any(word in col.lower() for word in ['survey', 'content', 'title', 'question'])]
-        logging.info(f"Survey-related columns: {survey_columns}")
-        
-        if survey_columns:
-            for col in survey_columns[:3]:
-                unique_values = data[col].dropna().unique()[:10]
-                logging.info(f"Column '{col}' sample values: {list(unique_values)}")
-        
-        # Проверим колонки с ответами
-        response_columns = [col for col in data.columns if any(word in col.lower() for word in ['response', 'answer', 'rating', 'score'])]
-        logging.info(f"Response-related columns: {response_columns}")
-        
-        if response_columns:
-            for col in response_columns[:3]:
-                unique_values = data[col].dropna().unique()[:10]
-                logging.info(f"Column '{col}' sample values: {list(unique_values)}")
+        """Logs data structure for diagnostics"""
+        try:
+            logging.info("=== DATA STRUCTURE ANALYSIS ===")
+            
+            # Log series-related columns
+            series_columns = [col for col in data.columns if 'series' in col.lower()]
+            if series_columns:
+                logging.info(f"Series columns: {series_columns}")
+                for col in series_columns[:2]:
+                    try:
+                        unique_values = data[col].dropna().unique()[:5]
+                        logging.info(f"'{col}' samples: {list(unique_values)}")
+                    except Exception as e:
+                        logging.warning(f"Error processing column {col}: {e}")
+            
+            # Log survey-related columns
+            survey_columns = [col for col in data.columns if any(word in col.lower() for word in ['survey', 'content', 'title', 'question'])]
+            if survey_columns:
+                logging.info(f"Survey columns: {survey_columns}")
+                for col in survey_columns[:2]:
+                    try:
+                        unique_values = data[col].dropna().unique()[:5]
+                        logging.info(f"'{col}' samples: {list(unique_values)}")
+                    except Exception as e:
+                        logging.warning(f"Error processing column {col}: {e}")
+            
+            # Log response columns
+            response_columns = [col for col in data.columns if any(word in col.lower() for word in ['response', 'answer', 'rating', 'score'])]
+            if response_columns:
+                logging.info(f"Response columns: {response_columns}")
+                for col in response_columns[:2]:
+                    try:
+                        unique_values = data[col].dropna().unique()[:5]
+                        logging.info(f"'{col}' samples: {list(unique_values)}")
+                    except Exception as e:
+                        logging.warning(f"Error processing column {col}: {e}")
+                        
+        except Exception as e:
+            logging.error(f"Error in data structure logging: {e}")
 
     def _find_series_data(self, data, config, lang_code):
-        """Находит данные для определенной series с улучшенной логикой"""
+        """Finds data for specific series with enhanced logic"""
         series_name = config['series_name']
         
-        # Попробуем разные варианты поиска series
-        possible_series_columns = ['series_title', 'series_name', 'content_title', 'series', 'title']
+        # Try different columns for series search
+        possible_series_columns = ['series_title', 'series_name', 'content_title', 'series']
         
         for col in possible_series_columns:
             if col in data.columns:
-                # Точное совпадение
-                exact_match = data[data[col] == series_name]
-                if not exact_match.empty:
-                    logging.info(f"Found series data by exact match in column '{col}' for {lang_code}")
-                    return exact_match
-                
-                # Частичное совпадение
-                partial_match = data[data[col].str.contains(series_name, na=False, case=False)]
-                if not partial_match.empty:
-                    logging.info(f"Found series data by partial match in column '{col}' for {lang_code}")
-                    return partial_match
+                try:
+                    # Exact match
+                    exact_match = data[data[col] == series_name]
+                    if not exact_match.empty:
+                        logging.info(f"Found series data by exact match in '{col}' for {lang_code}")
+                        return exact_match
+                    
+                    # Partial match
+                    partial_match = data[data[col].str.contains(series_name, na=False, case=False)]
+                    if not partial_match.empty:
+                        logging.info(f"Found series data by partial match in '{col}' for {lang_code}")
+                        return partial_match
+                except Exception as e:
+                    logging.warning(f"Error searching in column {col}: {e}")
         
-        # Если не нашли по series, попробуем найти по тексту вопроса NPS
+        # Fallback: search by NPS question content
         nps_question = config['nps_question']
         question_columns = ['question', 'content_title', 'body', 'text']
         
         for col in question_columns:
             if col in data.columns:
-                question_match = data[data[col].str.contains(nps_question[:50], na=False, case=False)]
-                if not question_match.empty:
-                    logging.info(f"Found data by NPS question match in column '{col}' for {lang_code}")
-                    return question_match
+                try:
+                    question_match = data[data[col].str.contains(nps_question[:50], na=False, case=False)]
+                    if not question_match.empty:
+                        logging.info(f"Found data by NPS question match in '{col}' for {lang_code}")
+                        return question_match
+                except Exception as e:
+                    logging.warning(f"Error searching by question in column {col}: {e}")
         
-        logging.warning(f"No series data found for {lang_code} using any method")
+        logging.warning(f"No series data found for {lang_code}")
         return pd.DataFrame()
 
     def _find_nps_surveys(self, series_data, config, lang_code):
-        """Находит NPS опросы в рамках series"""
+        """Finds NPS surveys within series data"""
         survey_pattern = config['survey_name_pattern']
         
-        # Попробуем разные колонки для поиска названий опросов
+        # Try different columns for survey name search
         possible_survey_columns = ['content_title', 'survey_name', 'title', 'name']
         
         for col in possible_survey_columns:
             if col in series_data.columns:
-                pattern_match = series_data[series_data[col].str.match(survey_pattern, na=False)]
-                if not pattern_match.empty:
-                    logging.info(f"Found NPS surveys by pattern in column '{col}' for {lang_code}")
-                    return pattern_match
+                try:
+                    pattern_match = series_data[series_data[col].str.match(survey_pattern, na=False)]
+                    if not pattern_match.empty:
+                        logging.info(f"Found NPS surveys by pattern in '{col}' for {lang_code}")
+                        return pattern_match
+                except Exception as e:
+                    logging.warning(f"Error matching pattern in column {col}: {e}")
         
-        # Если не нашли по паттерну, попробуем найти по содержанию "NPS"
+        # Fallback: search for "NPS" keyword
         for col in possible_survey_columns:
             if col in series_data.columns:
-                nps_match = series_data[series_data[col].str.contains('NPS', na=False, case=False)]
-                if not nps_match.empty:
-                    logging.info(f"Found surveys by 'NPS' keyword in column '{col}' for {lang_code}")
-                    return nps_match
+                try:
+                    nps_match = series_data[series_data[col].str.contains('NPS', na=False, case=False)]
+                    if not nps_match.empty:
+                        logging.info(f"Found surveys by 'NPS' keyword in '{col}' for {lang_code}")
+                        return nps_match
+                except Exception as e:
+                    logging.warning(f"Error searching NPS keyword in column {col}: {e}")
         
-        # Если ничего не нашли, вернем все данные series (возможно, структура другая)
+        # If nothing found, return all series data
         logging.warning(f"Using all series data as NPS surveys for {lang_code}")
         return series_data
 
     def _extract_nps_data(self, row, config, lang_code):
-        """Извлекает оценку NPS и отзыв из строки данных"""
+        """Extracts NPS score and review from data row"""
         score = None
         feedback = None
         
-        # УЛУЧШЕННЫЙ поиск оценки
-        # Ищем в колонках, которые могут содержать числовой ответ
+        # Search for score in various columns
         score_columns = ['response', 'answer', 'rating', 'score', 'value']
         nps_question = config['nps_question']
         
-        # Сначала попробуем найти колонку с точным названием вопроса
-        exact_question_col = None
+        # First, try to find column with exact question name
         for col in row.index:
-            if isinstance(row[col], str) and nps_question in str(col):
-                exact_question_col = col
-                break
+            if nps_question in str(col):
+                try:
+                    if pd.notnull(row[col]):
+                        score = self._parse_score(row[col])
+                        if score is not None:
+                            break
+                except Exception as e:
+                    logging.warning(f"Error extracting score from question column: {e}")
         
-        if exact_question_col and pd.notnull(row[exact_question_col]):
-            score = self._parse_score(row[exact_question_col])
-            logging.debug(f"Found score {score} in exact question column for {lang_code}")
-        
-        # Если не нашли в точной колонке, ищем в стандартных колонках
+        # If not found, search in standard columns
         if score is None:
             for col in score_columns:
-                if col in row.index and pd.notnull(row[col]):
-                    score = self._parse_score(row[col])
-                    if score is not None:
-                        logging.debug(f"Found score {score} in column '{col}' for {lang_code}")
-                        break
+                if col in row.index:
+                    try:
+                        if pd.notnull(row[col]):
+                            score = self._parse_score(row[col])
+                            if score is not None:
+                                break
+                    except Exception as e:
+                        logging.warning(f"Error extracting score from {col}: {e}")
         
-        # УЛУЧШЕННЫЙ поиск отзыва
+        # Search for feedback
         feedback_columns = ['body', 'message', 'feedback', 'comment', 'follow_up', 'text', 'content']
         for col in feedback_columns:
-            if col in row.index and pd.notnull(row[col]):
-                feedback_value = str(row[col]).strip()
-                if feedback_value and len(feedback_value) > 3:  # Минимальная длина отзыва
-                    feedback = feedback_value
-                    break
+            if col in row.index:
+                try:
+                    if pd.notnull(row[col]):
+                        feedback_value = str(row[col]).strip()
+                        if feedback_value and len(feedback_value) > 3:
+                            feedback = feedback_value
+                            break
+                except Exception as e:
+                    logging.warning(f"Error extracting feedback from {col}: {e}")
         
         return score, feedback
 
     def _parse_score(self, score_value):
-        """Парсит оценку из различных форматов"""
-        if pd.isna(score_value):
-            return None
-            
-        if isinstance(score_value, (int, float)):
-            score = int(score_value)
-            return score if 0 <= score <= 10 else None
-        
-        if isinstance(score_value, str):
-            # Убираем лишние символы
-            cleaned = re.sub(r'[^\d]', '', score_value)
-            if cleaned and cleaned.isdigit():
-                score = int(cleaned)
+        """Parses score from various formats"""
+        try:
+            if pd.isna(score_value):
+                return None
+                
+            if isinstance(score_value, (int, float)):
+                score = int(score_value)
                 return score if 0 <= score <= 10 else None
+            
+            if isinstance(score_value, str):
+                # Remove non-digits
+                cleaned = re.sub(r'[^\d]', '', score_value)
+                if cleaned and cleaned.isdigit():
+                    score = int(cleaned)
+                    return score if 0 <= score <= 10 else None
+        except Exception as e:
+            logging.warning(f"Error parsing score '{score_value}': {e}")
         
         return None
 
     def _extract_creation_date(self, row):
-        """Извлекает дату создания из различных колонок"""
+        """Extracts creation date from various columns"""
         date_columns = ['created_at', 'updated_at', 'submitted_at', 'answered_at', 'received_at']
         
         for col in date_columns:
-            if col in row.index and pd.notnull(row[col]):
+            if col in row.index:
                 try:
-                    date_value = row[col]
-                    if isinstance(date_value, str):
-                        # Попробуем разные форматы дат
-                        for date_format in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
-                            try:
-                                return datetime.strptime(date_value, date_format)
-                            except ValueError:
-                                continue
-                    elif isinstance(date_value, (int, float)):
-                        return datetime.fromtimestamp(date_value)
-                    elif isinstance(date_value, datetime):
-                        return date_value
-                except (ValueError, TypeError):
-                    continue
+                    if pd.notnull(row[col]):
+                        date_value = row[col]
+                        if isinstance(date_value, str):
+                            # Try different date formats
+                            for date_format in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+                                try:
+                                    return datetime.strptime(date_value, date_format)
+                                except ValueError:
+                                    continue
+                        elif isinstance(date_value, (int, float)):
+                            return datetime.fromtimestamp(date_value)
+                        elif isinstance(date_value, datetime):
+                            return date_value
+                except Exception as e:
+                    logging.warning(f"Error extracting date from {col}: {e}")
         
-        # Если не смогли извлечь дату, используем текущую
+        # If no date found, use current time
         logging.warning("Could not extract creation date, using current time")
         return datetime.now()
 
@@ -566,13 +564,6 @@ class CalculateNPS(beam.DoFn):
     """DoFn that calculates the NPS metric and formats reviews."""
     
     def __init__(self, period_type='monthly', run_period=None):
-        """
-        Initializes the transform with period configuration.
-
-        Args:
-            period_type: 'monthly' or 'quarterly'
-            run_period: String specifying the period being processed (e.g., 'YYYY-MM' or 'YYYY-Q1')
-        """
         self.period_type = period_type
         self.run_period = run_period
         
@@ -588,78 +579,76 @@ class CalculateNPS(beam.DoFn):
         
         # Group data by period for NPS calculation
         period_data = {}
-        
-        # Prepare reviews
         reviews = []
         all_periods = set()
         nps_periods = set()
         
         for result in results:
-            user_uuid = result.get('user_uuid')
-            user_name = result.get('user_name', '')
-            user_email = result.get('user_email', '')
-            country = result.get('country')
-            date_obj = result.get('date')
-            score = result.get('score')
-            review = result.get('review')
-            
-            # Determine period string for NPS grouping
-            if self.period_type == 'monthly':
-                period_str = date_obj.strftime('%Y-%m')
-            elif self.period_type == 'quarterly':
-                quarter = (date_obj.month - 1) // 3 + 1
-                period_str = f"{date_obj.year}-Q{quarter}"
-            else:
-                period_str = date_obj.strftime('%Y-%m')  # Default to monthly
-            
-            all_periods.add(period_str)
-            
-            # Filter by specific period if provided
-            if self.run_period and period_str != self.run_period:
-                logging.debug(f"Skipping data for period {period_str}, expected: {self.run_period}")
+            try:
+                user_uuid = result.get('user_uuid', '')
+                user_name = result.get('user_name', '')
+                user_email = result.get('user_email', '')
+                country = result.get('country', '')
+                date_obj = result.get('date')
+                score = result.get('score')
+                review = result.get('review', '')
+                
+                if not date_obj:
+                    continue
+                
+                # Determine period string for NPS grouping
+                if self.period_type == 'monthly':
+                    period_str = date_obj.strftime('%Y-%m')
+                elif self.period_type == 'quarterly':
+                    quarter = (date_obj.month - 1) // 3 + 1
+                    period_str = f"{date_obj.year}-Q{quarter}"
+                else:
+                    period_str = date_obj.strftime('%Y-%m')
+                
+                all_periods.add(period_str)
+                
+                # Filter by specific period if provided
+                if self.run_period and period_str != self.run_period:
+                    continue
+                
+                # Add data for NPS calculation (only if there is a score)
+                if score is not None:
+                    if period_str not in period_data:
+                        period_data[period_str] = {
+                            'scores': [],
+                            'country': country
+                        }
+                    period_data[period_str]['scores'].append(score)
+                    nps_periods.add(period_str)
+                
+                # Add review (even if text is empty, but there is a score)
+                if review or score is not None:
+                    # Determine quarter for review data
+                    year = date_obj.year
+                    quarter = (date_obj.month - 1) // 3 + 1
+                    quarter_str = f"{year} Q{quarter}"
+                    
+                    # Safely convert score to integer
+                    try:
+                        score_int = int(score) if score is not None else 0
+                    except (ValueError, TypeError):
+                        score_int = 0
+                    
+                    review_data = ReviewData(
+                        user_uuid=str(user_uuid),
+                        user_name=str(user_name),
+                        user_email=str(user_email),
+                        country=str(country),
+                        date=date_obj.strftime('%Y-%m-%d'),
+                        quarter=quarter_str,
+                        score=score_int,
+                        review=str(review)
+                    )
+                    reviews.append(review_data)
+                    
+            except Exception as e:
+                logging.error(f"Error processing result: {e}")
                 continue
-            
-            # Add data for NPS calculation (only if there is a score)
-            if score is not None:
-                if period_str not in period_data:
-                    period_data[period_str] = {
-                        'scores': [],
-                        'country': country
-                    }
-                period_data[period_str]['scores'].append(score)
-                nps_periods.add(period_str)
-            
-            # Add review (even if text is empty, but there is a score)
-            if review or score is not None:
-                # Determine quarter for review data
-                year = date_obj.year
-                quarter = (date_obj.month - 1) // 3 + 1
-                quarter_str = f"{year} Q{quarter}"
-                
-                # Safely convert data to string
-                user_uuid_str = str(user_uuid) if user_uuid else ""
-                user_name_str = str(user_name) if user_name else ""
-                user_email_str = str(user_email) if user_email else ""
-                review_str = str(review) if review else ""
-                
-                # Safely convert score to integer
-                try:
-                    score_int = int(score) if score is not None else 0
-                except (ValueError, TypeError):
-                    logging.warning(f"Could not convert score '{score}' to int, defaulting to 0")
-                    score_int = 0
-                
-                review_data = ReviewData(
-                    user_uuid=user_uuid_str,
-                    user_name=user_name_str,
-                    user_email=user_email_str,
-                    country=country,
-                    date=date_obj.strftime('%Y-%m-%d'),
-                    quarter=quarter_str,
-                    score=score_int,
-                    review=review_str
-                )
-                reviews.append(review_data)
         
         logging.info(f"Prepared {len(reviews)} reviews for region {region}")
         logging.info(f"Periods found: {sorted(list(all_periods))}")
@@ -668,29 +657,32 @@ class CalculateNPS(beam.DoFn):
         # Calculate NPS for each period
         nps_results = []
         for period, data in period_data.items():
-            scores = data['scores']
-            country = data['country']
-            
-            if not scores:
-                continue
+            try:
+                scores = data['scores']
+                country = data['country']
                 
-            promoters = sum(1 for s in scores if s >= 9)
-            detractors = sum(1 for s in scores if s <= 6)
-            total = len(scores)
-            neutral = total - promoters - detractors
-            
-            # Create NPS record
-            nps_results.append(NPSData(
-                month=period,  # This could be month or quarter depending on period_type
-                country=country,
-                total=total,
-                promoters=promoters,
-                neutral=neutral,
-                detractors=detractors
-            ))
+                if not scores:
+                    continue
+                    
+                promoters = sum(1 for s in scores if s >= 9)
+                detractors = sum(1 for s in scores if s <= 6)
+                total = len(scores)
+                neutral = total - promoters - detractors
+                
+                # Create NPS record
+                nps_results.append(NPSData(
+                    month=period,
+                    country=country,
+                    total=total,
+                    promoters=promoters,
+                    neutral=neutral,
+                    detractors=detractors
+                ))
+            except Exception as e:
+                logging.error(f"Error calculating NPS for period {period}: {e}")
+                continue
         
         logging.info(f"Calculated NPS for {len(nps_results)} periods in region {region}")
-        logging.info(f"Found {len(reviews)} reviews in region {region}")
         
         # Return NPS results and reviews
         for nps_result in nps_results:
@@ -862,59 +854,6 @@ class WriteReviewsToSheets(beam.DoFn):
             yield {'status': 'error', 'error': error_message}
 
 
-def debug_intercom_data(api_key, start_date, end_date):
-    """Функция для отладки структуры данных Intercom"""
-    print("=== ОТЛАДКА СТРУКТУРЫ ДАННЫХ INTERCOM ===")
-    
-    intercom_service = IntercomService(api_key)
-    data = intercom_service.get_nps_data(start_date, end_date)
-    
-    if data is None:
-        print("Не удалось загрузить данные")
-        return
-    
-    print(f"Загружено {len(data)} строк")
-    print(f"Колонки ({len(data.columns)}): {list(data.columns)}")
-    
-    # Посмотрим на первые несколько строк
-    print("\nПервые 3 строки (все колонки):")
-    print(data.head(3).to_string())
-    
-    # Найдем колонки с возможными названиями опросов
-    survey_cols = [col for col in data.columns if any(word in col.lower() for word in ['content', 'title', 'series', 'survey'])]
-    print(f"\nКолонки с названиями: {survey_cols}")
-    
-    for col in survey_cols[:5]:  # Показать первые 5
-        unique_vals = data[col].dropna().unique()[:15]
-        print(f"\n{col}: {list(unique_vals)}")
-    
-    # Найдем колонки с возможными ответами
-    response_cols = [col for col in data.columns if any(word in col.lower() for word in ['response', 'answer', 'rating'])]
-    print(f"\nКолонки с ответами: {response_cols}")
-    
-    for col in response_cols[:5]:
-        unique_vals = data[col].dropna().unique()[:15]
-        print(f"\n{col}: {list(unique_vals)}")
-    
-    # Поиск NPS данных
-    nps_questions = [
-        "How likely is it that you would recommend HEALBE GoBe",
-        "Пожалуйста, оцените вероятность того, что вы порекомендуете",
-        "友人やご家族のメンバーにGoBeをお勧めしますか"
-    ]
-    
-    print("\n=== ПОИСК NPS ДАННЫХ ===")
-    for question_part in nps_questions:
-        print(f"\nПоиск '{question_part}':")
-        for col in data.columns:
-            if data[col].dtype == 'object':
-                matches = data[data[col].str.contains(question_part, na=False, case=False)]
-                if not matches.empty:
-                    print(f"  Найдено {len(matches)} совпадений в колонке '{col}'")
-                    if len(matches) <= 5:
-                        print(f"    Примеры: {list(matches[col].head(3))}")
-
-
 def run(argv=None):
     """Entry point for the NPS Dataflow pipeline."""
     
@@ -952,9 +891,26 @@ def run(argv=None):
             known_args.period_offset
         )
     
-    # Режим отладки только данных
+    # Debug data only mode
     if known_args.debug_data_only:
-        debug_intercom_data(known_args.api_key, start_date, end_date)
+        logging.info("Running in debug_data_only mode - will exit after data analysis")
+        intercom_service = IntercomService(known_args.api_key)
+        data = intercom_service.get_nps_data(start_date, end_date)
+        
+        if data is not None:
+            logging.info(f"Data loaded successfully: {len(data)} rows, {len(data.columns)} columns")
+            logging.info(f"Columns: {list(data.columns)}")
+            
+            # Basic analysis
+            for i, (idx, row) in enumerate(data.head(3).iterrows()):
+                key_cols = [col for col in row.index if any(word in col.lower() for word in 
+                           ['content', 'title', 'series', 'survey', 'response', 'answer', 'question'])]
+                if key_cols:
+                    key_data = {col: row[col] for col in key_cols if pd.notnull(row[col])}
+                    logging.info(f"Row {i} key data: {key_data}")
+        else:
+            logging.error("Failed to load data from Intercom")
+        
         return
     
     pipeline_options = PipelineOptions(pipeline_args)
@@ -970,7 +926,6 @@ def run(argv=None):
             quarter = (start_dt.month - 1) // 3 + 1
             run_period = f"{start_dt.year}-Q{quarter}"
     
-    # Map argument to local variable for clarity
     nps_table = known_args.target_table
     
     if run_period:
@@ -986,16 +941,17 @@ def run(argv=None):
         # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])
         
-        # Fetch data from Intercom using the new series-based approach
+        # Fetch data from Intercom
         intercom_data = dummy_input | "Fetch Intercom Data" >> beam.ParDo(
             FetchIntercomData(
                 known_args.api_key,
                 start_date,
-                end_date
+                end_date,
+                debug_mode=known_args.debug
             )
         )
         
-        # Calculate NPS and format reviews with period configuration
+        # Calculate NPS and format reviews
         nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(
             CalculateNPS(
                 period_type=known_args.period_type,
