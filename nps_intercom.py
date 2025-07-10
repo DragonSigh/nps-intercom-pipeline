@@ -934,9 +934,6 @@ def run(argv=None):
         logging.info("Starting NPS pipeline in debug mode (no period filtering)")
 
     with beam.Pipeline(options=pipeline_options) as p:
-        # Register coders for custom NamedTuple types
-        beam.coders.registry.register_coder(NPSData, beam.coders.RowCoder)
-        beam.coders.registry.register_coder(ReviewData, beam.coders.RowCoder)
         
         # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])

@@ -97,14 +97,5 @@
         "^(true|false)$"
       ]
     }
-  ],
-  "defaultEnvironment": {
-    "numWorkers": 2,
-    "maxWorkers": 5,
-    "serviceAccountEmail": "986072438729-compute@developer.gserviceaccount.com",
-    "machineType": "n1-standard-2",
-    "additionalExperiments": [
-      "use_runner_v2"
-    ]
-  }
+  ]
 }
