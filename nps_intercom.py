@@ -368,19 +368,36 @@ class IntercomService:
 
         logging.info(f"Fetching conversations updated between {start_date} and {end_date} ...")
 
-        # Initial request – list conversations updated since start date.
-        # We request all states to capture closed conversations too.
-        next_url = f"{self.base_url}/conversations?per_page=60&updated_since={start_ts}&state=all&sort=created_at&order=asc"
+        # Conversations search payload – filter by updated_at range to minimise pages.
+        base_search_url = f"{self.base_url}/conversations/search"
 
-        # Defensive: verify that the URL string is well-formed.
-        if not isinstance(next_url, str):
-            raise ValueError("Constructed Intercom conversations URL is not a string")
+        search_body = {
+            "query": {
+                "operator": "AND",
+                "value": [
+                    {
+                        "field": "updated_at",
+                        "operator": ">",
+                        "value": str(start_ts)
+                    },
+                    {
+                        "field": "updated_at",
+                        "operator": "<",
+                        "value": str(end_ts)
+                    }
+                ]
+            },
+            "pagination": {
+                "per_page": 150
+            }
+        }
+
         all_results = []
-
-        while next_url:
-            response = self._make_request_with_retry('GET', next_url, headers=self.headers)
+        has_more = True
+        while has_more:
+            response = self._make_request_with_retry('POST', base_search_url, headers=self.headers, json=search_body)
             if response.status_code != 200:
-                logging.error(f"Failed to list conversations: {response.status_code} – {response.text[:200]}")
+                logging.error(f"Failed to search conversations: {response.status_code} – {response.text[:200]}")
                 break
 
             payload = response.json()
@@ -404,8 +421,8 @@ class IntercomService:
                     continue
                 conv_detail = detail_resp.json()
 
-                # Extract the starter/admin message body (HTML)
-                body_html = conv_detail.get('body', '') or ''
+                # Extract the starter/admin message body (HTML) – resides under source.body
+                body_html = conv_detail.get('source', {}).get('body', '') or ''
                 body_plain = re.sub('<[^<]+?>', '', body_html)
 
                 matched_lang = None
@@ -434,23 +451,9 @@ class IntercomService:
                 # subsequent conversation parts authored by the user.
                 replies = []
 
-                # 1️⃣ Initial user reply may be in "conversation_message" when the
-                # conversation *starts* with a user message. In our case the starter
-                # message is from admin, so we focus on parts. Still, be defensive.
-                conv_msg = conv_detail.get('conversation_message', {})
-                if isinstance(conv_msg, dict):
-                    author = conv_msg.get('author', {})
-                    if author.get('type') == 'user':
-                        msg_body = conv_msg.get('body', '')
-                        msg_clean = re.sub('<[^<]+?>', '', msg_body).strip()
-                        if msg_clean:
-                            replies.append({
-                                'created_at': conv_msg.get('created_at'),
-                                'author': author,
-                                'text': msg_clean,
-                            })
-
-                # 2️⃣ conversation_parts container
+                # 1️⃣ Initial user reply (if any) resides in conversation_parts as
+                #     the first part authored by the user – we do not rely on
+                #     deprecated "conversation_message" field anymore.
                 parts_container = conv_detail.get('conversation_parts', {})
                 parts = parts_container.get('conversation_parts', []) if isinstance(parts_container, dict) else []
                 for part in parts:
@@ -479,18 +482,16 @@ class IntercomService:
                         'source': 'chat',
                     })
 
-            # Pagination – Intercom v2 returns link in "pages.next".
-            pages_next = payload.get('pages', {}).get('next')
-            if pages_next:
-                # Some APIs return relative paths like "/conversations?start=..."
-                if not pages_next.startswith('http'):
-                    pages_next = f"{self.base_url}{pages_next}"
-
-                if not isinstance(pages_next, str):
-                    logging.error(f"Unexpected paginator 'next' value type: {type(pages_next)} – stopping iteration")
-                    pages_next = None
-
-            next_url = pages_next
+            # Pagination – cursor based; "pages.next" returns the next cursor value.
+            next_cursor = payload.get('pages', {}).get('next')
+            if next_cursor:
+                search_body["pagination"] = {
+                    "per_page": 150,
+                    "starting_after": next_cursor
+                }
+                has_more = True
+            else:
+                has_more = False
 
         logging.info(f"Collected {len(all_results)} chat reviews")
         return all_results
