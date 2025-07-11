@@ -371,6 +371,10 @@ class IntercomService:
         # Initial request – list conversations updated since start date.
         # We request all states to capture closed conversations too.
         next_url = f"{self.base_url}/conversations?per_page=60&updated_since={start_ts}&state=all&sort=created_at&order=asc"
+
+        # Defensive: verify that the URL string is well-formed.
+        if not isinstance(next_url, str):
+            raise ValueError("Constructed Intercom conversations URL is not a string")
         all_results = []
 
         while next_url:
@@ -475,8 +479,18 @@ class IntercomService:
                         'source': 'chat',
                     })
 
-            # Pagination – Intercom v2 returns link in "pages.next"
-            next_url = payload.get('pages', {}).get('next')
+            # Pagination – Intercom v2 returns link in "pages.next".
+            pages_next = payload.get('pages', {}).get('next')
+            if pages_next:
+                # Some APIs return relative paths like "/conversations?start=..."
+                if not pages_next.startswith('http'):
+                    pages_next = f"{self.base_url}{pages_next}"
+
+                if not isinstance(pages_next, str):
+                    logging.error(f"Unexpected paginator 'next' value type: {type(pages_next)} – stopping iteration")
+                    pages_next = None
+
+            next_url = pages_next
 
         logging.info(f"Collected {len(all_results)} chat reviews")
         return all_results
