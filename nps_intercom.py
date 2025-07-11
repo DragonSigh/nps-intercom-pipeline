@@ -12,7 +12,8 @@ import os
 import json
 from datetime import datetime, date, timedelta
 
-import pandas as pd
+import csv
+import math
 import google.auth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -110,6 +111,58 @@ def calculate_period_dates(period_type='monthly', period_offset=1):
     return start_date_str, end_date_str
 
 
+def parse_datetime(value):
+    """Parse a variety of timestamp representations without pandas.
+
+    Supported inputs:
+        * Unix epoch seconds or milliseconds (int / float)
+        * ISO-8601 strings with or without fractional seconds / trailing "Z"
+
+    Returns a ``datetime`` instance or ``None`` if parsing fails.
+    """
+    # --- Missing values -----------------------------------------------------
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+
+    # --- Numeric epoch ------------------------------------------------------
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ts = float(value)
+        # Milliseconds → seconds heuristic
+        if ts > 1e12:
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts)
+        except Exception:
+            pass
+
+    # --- ISO-8601 strings ---------------------------------------------------
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+
+        # Fast path using stdlib (Python ≥3.11)
+        try:
+            return datetime.fromisoformat(value.rstrip("Z"))
+        except Exception:
+            pass
+
+        # Fallback: manual regex-based parse for common shapes
+        iso_regex = r'^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?'
+        m = re.match(iso_regex, value.rstrip("Z"))
+        if m:
+            fmt = "%Y-%m-%d %H:%M:%S" + (".%f" if m.group(3) else "")
+            try:
+                return datetime.strptime(value[:len(m.group(0))], fmt)
+            except Exception:
+                pass
+
+    # Could not parse
+    return None
+
+
 class IntercomService:
     """Service wrapper for Intercom API interactions with improved error handling."""
     
@@ -171,47 +224,49 @@ class IntercomService:
             return None
 
     def download_export_results(self, download_url):
-        """Downloads and extracts export results with improved error handling."""
+        """Download Intercom export and return a list[dict] of rows parsed from CSV.
+
+        Supports GZIP-compressed CSV, ZIP archives with one or more CSVs and
+        plain CSV payloads. Uses only the Python standard library, avoiding
+        pandas to stay compatible with Apache Beam environments.
+        """
         download_headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/octet-stream"
         }
-        
+
         response = self._make_request_with_retry('GET', download_url, headers=download_headers)
-        
         if response.status_code != 200:
             logging.error(f"Error while downloading results: {response.status_code}")
             return None
-        
+
         content = response.content
-        
+
+        def _rows_from_csv(raw: bytes):
+            text_stream = io.StringIO(raw.decode('utf-8', errors='replace'))
+            return list(csv.DictReader(text_stream))
+
         try:
-            # Detect file signature and process accordingly
-            if content[:2] == b'\x1f\x8b':  # GZ
+            # GZIP (.gz)
+            if content[:2] == b'\x1f\x8b':
                 with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
-                    df = pd.read_csv(gz)
-                return df
-            elif content[:2] == b'PK':  # ZIP
+                    return _rows_from_csv(gz.read())
+
+            # ZIP (.zip)
+            if content[:2] == b'PK':
+                rows = []
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                    dfs = []
-                    for filename in zf.namelist():
-                        if filename.endswith('.csv'):
-                            with zf.open(filename) as csvfile:
-                                dfs.append(pd.read_csv(csvfile))
-                    if dfs:
-                        df = pd.concat(dfs, ignore_index=True)
-                        return df
+                    for fname in zf.namelist():
+                        if fname.endswith('.csv'):
+                            with zf.open(fname) as f:
+                                rows.extend(_rows_from_csv(f.read()))
+                if not rows:
                     logging.error("No CSV files found inside the ZIP archive.")
                     return None
-            else:
-                # Try as plain CSV
-                try:
-                    df = pd.read_csv(io.BytesIO(content))
-                    return df
-                except Exception as e:
-                    logging.error(f"Failed to parse as CSV: {e}")
-                    return None
-                    
+                return rows
+
+            # Plain CSV
+            return _rows_from_csv(content)
         except Exception as e:
             logging.error(f"Error processing file content: {e}")
             return None
@@ -245,11 +300,11 @@ class IntercomService:
                     return None
 
                 logging.info("Downloading and processing data...")
-                df = self.download_export_results(download_url)
+                rows = self.download_export_results(download_url)
                 
-                if df is not None:
-                    logging.info(f"Loaded {len(df)} rows")
-                    return df
+                if rows is not None:
+                    logging.info(f"Loaded {len(rows)} rows")
+                    return rows
                 else:
                     logging.error("Failed to load data")
                     return None
@@ -276,99 +331,94 @@ class FetchIntercomData(beam.DoFn):
         intercom_service = IntercomService(self.api_key)
         data = intercom_service.get_nps_data(self.start_date, self.end_date)
         
-        if data is None:
-            logging.warning("Failed to retrieve data from Intercom")
+        if not data:
+            logging.warning("Failed to retrieve data from Intercom or dataset is empty")
             return
-        
-        logging.info(f"Loaded columns: {list(data.columns)}")
-        
-        # Process data for each region/language - ORIGINAL LOGIC
+
+        logging.info(f"Loaded columns: {list(data[0].keys()) if isinstance(data, list) else 'unknown'}")
+
+        # Process data for each language configuration
         for lang_code, config in NPS_SURVEYS.items():
             logging.info(f"Processing data for language: {lang_code}")
-            
-            # Filter data for this specific series
-            series_data = data[data.get('series_name', '') == config['series_name']] if 'series_name' in data.columns else data
-            
-            if series_data.empty:
+
+            # Filter by series name if present
+            if any('series_name' in row for row in data):
+                series_data = [r for r in data if r.get('series_name', '') == config['series_name']]
+            else:
+                series_data = data
+
+            if not series_data:
                 logging.warning(f"No data found for series: {config['series_name']}")
                 continue
-            
-            # Filter for NPS surveys within the series
-            nps_surveys = series_data[
-                series_data.get('survey_name', '').str.match(config['survey_name_pattern'], na=False)
-            ] if 'survey_name' in series_data.columns else series_data
-            
-            if nps_surveys.empty:
+
+            # Filter by survey name regex if present
+            pattern = re.compile(config['survey_name_pattern'])
+            if any('survey_name' in row for row in series_data):
+                nps_surveys = [r for r in series_data if pattern.match(str(r.get('survey_name', '')))]
+            else:
+                nps_surveys = series_data
+
+            if not nps_surveys:
                 logging.warning(f"No NPS surveys found for pattern: {config['survey_name_pattern']}")
                 continue
-            
-            logging.info(f"Found {len(nps_surveys)} NPS survey responses for {lang_code}")
-            
-            results = []
-            
-            for _, row in nps_surveys.iterrows():
-                score = None
-                feedback = None
-                
-                # Extract NPS score
-                score_columns = ['answer', 'rating', 'score', 'response']
-                for col in score_columns:
-                    if col in row and pd.notnull(row[col]):
-                        score_value = row[col]
-                        
-                        if isinstance(score_value, str):
-                            if score_value.isdigit():
-                                score = int(score_value)
-                            else:
-                                match = re.search(r'\d+', score_value)
-                                if match:
-                                    score = int(match.group())
-                        elif isinstance(score_value, (int, float)):
-                            score = int(score_value)
-                        
-                        if score is not None:
-                            break
-                
-                # Extract feedback
-                feedback_columns = ['body', 'message', 'feedback', 'comment', 'follow_up']
-                for col in feedback_columns:
-                    if col in row and pd.notnull(row[col]):
-                        feedback_value = row[col]
-                        if isinstance(feedback_value, str) and feedback_value.strip():
-                            feedback = feedback_value.strip()
-                            break
-                
-                # Extract user information
-                user_id = row.get('user_id') or row.get('user_external_id') or row.get('contact_id')
-                user_name = row.get('name', '') or row.get('user_name', '')
-                user_email = row.get('email', '') or row.get('user_email', '')
-                
-                # Extract creation date – use robust helper that can handle fractional seconds
-                raw_created_at = (
-                    row.get('created_at')
-                    or row.get('updated_at')
-                    or row.get('submitted_at')
-                )
 
-                parsed_dt = parse_datetime(raw_created_at)
-                if parsed_dt is None and raw_created_at is not None:
+            logging.info(f"Found {len(nps_surveys)} NPS survey responses for {lang_code}")
+
+            results = []
+            for row in nps_surveys:
+                # Extract score ------------------------------------------------
+                score = None
+                for col in ['answer', 'rating', 'score', 'response']:
+                    val = row.get(col)
+                    if val in (None, '', 'NaN'):
+                        continue
+                    if isinstance(val, str):
+                        val_str = val.strip()
+                        if val_str.isdigit():
+                            score = int(val_str)
+                        else:
+                            m = re.search(r'\d+', val_str)
+                            if m:
+                                score = int(m.group())
+                    elif isinstance(val, (int, float)):
+                        score = int(val)
+                    if score is not None:
+                        break
+
+                # Extract feedback ------------------------------------------
+                feedback = None
+                for col in ['body', 'message', 'feedback', 'comment', 'follow_up']:
+                    val = row.get(col)
+                    if isinstance(val, str) and val.strip():
+                        feedback = val.strip()
+                        break
+
+                # User info ---------------------------------------------------
+                user_id = row.get('user_id') or row.get('user_external_id') or row.get('contact_id')
+                user_name = row.get('name') or row.get('user_name', '')
+                user_email = row.get('email') or row.get('user_email', '')
+
+                # Datetime ----------------------------------------------------
+                raw_created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
+                created_dt = parse_datetime(raw_created_at)
+                if created_dt is None and raw_created_at is not None:
                     logging.warning(f"Could not parse date '{raw_created_at}' – falling back to current time")
-                created_at = parsed_dt or datetime.now()
-                
-                # Add result if we have a score or feedback
+                created_at = created_dt or datetime.now()
+
+                # Compose result ---------------------------------------------
                 if score is not None or (feedback and feedback.strip()):
                     results.append({
-                        'user_uuid': str(user_id) if user_id else "",
-                        'user_name': str(user_name) if user_name else "",
-                        'user_email': str(user_email) if user_email else "",
+                        'user_uuid': str(user_id or ''),
+                        'user_name': str(user_name or ''),
+                        'user_email': str(user_email or ''),
                         'country': config['country_code'],
                         'date': created_at,
                         'score': score,
                         'review': feedback
                     })
-            
+
             logging.info(f"Processed {len(results)} records for {lang_code}")
-            
+
             if results:
                 yield {
                     'region': config['country_code'],
