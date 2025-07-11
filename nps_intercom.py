@@ -741,7 +741,18 @@ class CalculateNPS(beam.DoFn):
         
         logging.info(f"Calculated NPS for {len(nps_results)} periods in region {region}")
         logging.info(f"Found {len(reviews)} reviews in region {region}")
-        
+
+        # Debug: show a preview of the first 10 reviews for easier troubleshooting
+        if reviews:
+            sample = reviews[:10]
+            # Convert Beam Row objects to plain dicts for better readability in logs
+            sample_pretty = [r._asdict() if hasattr(r, "_asdict") else dict(r) if isinstance(r, dict) else str(r) for r in sample]
+            logging.debug(
+                "First %d reviews sample:\n%s",
+                len(sample_pretty),
+                json.dumps(sample_pretty, ensure_ascii=False, default=str, indent=2)
+            )
+
         # Return NPS results and reviews
         for nps_result in nps_results:
             yield ('nps', nps_result)
