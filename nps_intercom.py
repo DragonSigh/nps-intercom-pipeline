@@ -368,7 +368,13 @@ class FetchIntercomData(beam.DoFn):
             for row in nps_surveys:
                 # Extract score ------------------------------------------------
                 score = None
-                for col in ['answer', 'rating', 'score', 'response']:
+                # Possible columns containing the numeric NPS score
+                score_columns = ['answer', 'rating', 'score', 'response']
+                # Add the exact survey question column defined in config (if any)
+                if config.get('nps_question'):
+                    score_columns.append(config['nps_question'])
+
+                for col in score_columns:
                     val = row.get(col)
                     if val in (None, '', 'NaN'):
                         continue
@@ -399,7 +405,13 @@ class FetchIntercomData(beam.DoFn):
                 user_email = row.get('email') or row.get('user_email', '')
 
                 # Datetime ----------------------------------------------------
-                raw_created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
+                # Try multiple timestamp columns – Intercom export uses "received_at" for message receipts
+                raw_created_at = (
+                    row.get('created_at')
+                    or row.get('received_at')
+                    or row.get('updated_at')
+                    or row.get('submitted_at')
+                )
                 created_dt = parse_datetime(raw_created_at)
                 if created_dt is None and raw_created_at is not None:
                     logging.warning(f"Could not parse date '{raw_created_at}' – falling back to current time")
