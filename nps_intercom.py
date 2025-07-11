@@ -228,7 +228,7 @@ class IntercomService:
         logging.info(f"Export job created. ID: {job_id}")
 
         # Wait for job completion
-        max_attempts = 30
+        max_attempts = 60
         for attempt in range(max_attempts):
             status_info = self.check_export_status(job_id)
             if not status_info:
@@ -343,22 +343,17 @@ class FetchIntercomData(beam.DoFn):
                 user_name = row.get('name', '') or row.get('user_name', '')
                 user_email = row.get('email', '') or row.get('user_email', '')
                 
-                # Extract creation date
-                created_at = row.get('created_at') or row.get('updated_at') or row.get('submitted_at')
-                if created_at:
-                    try:
-                        if isinstance(created_at, str):
-                            if 'T' in created_at:
-                                created_at = datetime.strptime(created_at.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                            else:
-                                created_at = datetime.strptime(created_at, "%Y-%m-%d")
-                        elif isinstance(created_at, (int, float)):
-                            created_at = datetime.fromtimestamp(created_at)
-                    except (ValueError, TypeError) as e:
-                        logging.warning(f"Could not parse date '{created_at}': {e}")
-                        created_at = datetime.now()
-                else:
-                    created_at = datetime.now()
+                # Extract creation date – use robust helper that can handle fractional seconds
+                raw_created_at = (
+                    row.get('created_at')
+                    or row.get('updated_at')
+                    or row.get('submitted_at')
+                )
+
+                parsed_dt = parse_datetime(raw_created_at)
+                if parsed_dt is None and raw_created_at is not None:
+                    logging.warning(f"Could not parse date '{raw_created_at}' – falling back to current time")
+                created_at = parsed_dt or datetime.now()
                 
                 # Add result if we have a score or feedback
                 if score is not None or (feedback and feedback.strip()):
