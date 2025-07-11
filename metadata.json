@@ -1,6 +1,6 @@
 {
   "name": "Intercom NPS Pipeline",
-  "description": "Pipeline that fetches NPS data from Intercom with streaming processing and enhanced error handling. Calculates metrics and saves to BigQuery and Google Sheets.",
+  "description": "Pipeline that fetches NPS data from Intercom with streaming processing and enhanced error handling. Calculates aggregated metrics and saves to BigQuery. Saves raw reviews to Google Sheets.",
   "parameters": [
     {
       "name": "api_key",

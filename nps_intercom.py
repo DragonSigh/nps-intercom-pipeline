@@ -557,6 +557,8 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
             )
         else:
             logging.info("Using Application Default Credentials")
+            logging.warning("IMPORTANT: Dataflow's default service account may not have Google Sheets API access. "
+                          "Consider using --credentials_path with a service account that has 'Google Sheets API' enabled.")
             credentials, _ = google.auth.default(
                 scopes=['https://www.googleapis.com/auth/spreadsheets']
             )
@@ -564,6 +566,8 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
         service = build('sheets', 'v4', credentials=credentials)
     except Exception as e:
         logging.error(f"Failed to authenticate with Google Sheets: {e}")
+        logging.error("If using Dataflow, ensure your service account has Google Sheets API permissions "
+                     "or use --credentials_path parameter")
         return None
     
     try:
@@ -724,6 +728,7 @@ def run(argv=None):
                        help='How many periods back to collect (1 = previous period)')
     
     parser.add_argument('--credentials_path', help='Path to service account credentials file for Google Sheets')
+    
     parser.add_argument('--debug', type=str, default='false', choices=['true', 'false'], 
                        help='Enable debug mode (no period filtering)')
     
