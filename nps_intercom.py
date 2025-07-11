@@ -747,11 +747,11 @@ class CalculateNPS(beam.DoFn):
             sample = reviews[:10]
             # Convert Beam Row objects to plain dicts for better readability in logs
             sample_pretty = [r._asdict() if hasattr(r, "_asdict") else dict(r) if isinstance(r, dict) else str(r) for r in sample]
-            logging.debug(
-                "First %d reviews sample:\n%s",
-                len(sample_pretty),
-                json.dumps(sample_pretty, ensure_ascii=False, default=str, indent=2)
+            logging.info(
+                "===== SAMPLE REVIEWS (first %d of %d) =====", len(sample_pretty), len(reviews)
             )
+            for idx, review in enumerate(sample_pretty, 1):
+                logging.info("SAMPLE_REVIEW_%02d: %s", idx, json.dumps(review, ensure_ascii=False, default=str))
 
         # Return NPS results and reviews
         for nps_result in nps_results:
