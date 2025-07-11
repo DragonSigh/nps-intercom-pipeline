@@ -60,6 +60,37 @@ NPS_SCHEMA = {
     ]
 }
 
+# ------------- NEW CONSTANTS FOR CHAT FLOW DETECTION -----------------------
+# Regex patterns to detect NPS follow-up chats in different languages.
+# These are matched against the *admin* starter message (HTML stripped).
+NPS_CHAT_PATTERNS = {
+    'ENG': {
+        'promoter': r'Thank you for the great rating',
+        'neutral': r'In your opinion, what would make',
+        'detractor': r'we noticed that your experience',
+    },
+    'RU': {
+        'promoter': r'Спасибо за высокую оценку',
+        'neutral': r'Нам важно стать лучше',
+        'detractor': r'мы видим, что вы оценили',
+    },
+    'JP': {
+        'promoter': r'素晴らしい評価',
+        'neutral': r'ご評価いただき',
+        'detractor': r'ご期待に添えずご満足いただけなかった',
+    },
+}
+
+# Mapping from category to a representative numeric score so that downstream
+# logic expecting an integer score can continue to work. These values are *not*
+# included in the official NPS calculation – CalculateNPS excludes chat-sourced
+# scores – but they remain useful for filtering/export.
+CHAT_CATEGORY_SCORE = {
+    'promoter': 10,
+    'neutral': 8,
+    'detractor': 6,
+}
+
 
 def date_to_unix(date_str):
     """Converts a YYYY-MM-DD date string to Unix timestamp."""
@@ -318,6 +349,138 @@ class IntercomService:
         logging.error(f"Exceeded maximum attempts ({max_attempts}) to check export status")
         return None
 
+    def get_nps_chat_reviews(self, start_date, end_date):
+        """Fetches user replies to NPS follow-up chats for the given period.
+
+        The function scans all conversations updated since *start_date*, filters
+        those whose starter/admin message matches one of the language-specific
+        NPS follow-up chat templates and harvests user replies (conversation
+        parts authored by a contact of type "user").
+
+        Returns
+        -------
+        List[dict]
+            Each dict contains the same keys as survey rows expected by the
+            pipeline, plus ``category`` and ``source`` fields.
+        """
+        start_ts = date_to_unix(start_date)
+        end_ts = date_to_unix(end_date)
+
+        logging.info(f"Fetching conversations updated between {start_date} and {end_date} ...")
+
+        # Initial request – list conversations updated since start date.
+        # We request all states to capture closed conversations too.
+        next_url = f"{self.base_url}/conversations?per_page=60&updated_since={start_ts}&state=all&sort=created_at&order=asc"
+        all_results = []
+
+        while next_url:
+            response = self._make_request_with_retry('GET', next_url, headers=self.headers)
+            if response.status_code != 200:
+                logging.error(f"Failed to list conversations: {response.status_code} – {response.text[:200]}")
+                break
+
+            payload = response.json()
+            conversations = payload.get('conversations', [])
+            logging.info(f"Scanning {len(conversations)} conversations page ...")
+
+            for conv in conversations:
+                created_at = conv.get('created_at') or 0
+                # Skip conversations outside the requested bounds
+                if created_at < start_ts or created_at >= end_ts:
+                    continue
+
+                conv_id = conv.get('id')
+                if not conv_id:
+                    continue
+
+                # Retrieve full conversation details to access body & parts
+                detail_resp = self._make_request_with_retry('GET', f"{self.base_url}/conversations/{conv_id}", headers=self.headers)
+                if detail_resp.status_code != 200:
+                    logging.warning(f"Could not fetch conversation {conv_id}: {detail_resp.status_code}")
+                    continue
+                conv_detail = detail_resp.json()
+
+                # Extract the starter/admin message body (HTML)
+                body_html = conv_detail.get('body', '') or ''
+                body_plain = re.sub('<[^<]+?>', '', body_html)
+
+                matched_lang = None
+                matched_cat = None
+                for lang, cat_map in NPS_CHAT_PATTERNS.items():
+                    for cat, pattern in cat_map.items():
+                        try:
+                            if re.search(pattern, body_plain, re.IGNORECASE):
+                                matched_lang = lang
+                                matched_cat = cat
+                                break
+                        except re.error as e:
+                            logging.error(f"Invalid regex '{pattern}' – {e}")
+                    if matched_lang:
+                        break
+
+                # Skip if conversation is not an NPS follow-up chat
+                if not matched_lang or not matched_cat:
+                    continue
+
+                score_value = CHAT_CATEGORY_SCORE.get(matched_cat)
+                config = NPS_SURVEYS.get(matched_lang)
+                country_code = config['country_code'] if config else ''
+
+                # Collect user replies – both the initial inbound message (if any) and
+                # subsequent conversation parts authored by the user.
+                replies = []
+
+                # 1️⃣ Initial user reply may be in "conversation_message" when the
+                # conversation *starts* with a user message. In our case the starter
+                # message is from admin, so we focus on parts. Still, be defensive.
+                conv_msg = conv_detail.get('conversation_message', {})
+                if isinstance(conv_msg, dict):
+                    author = conv_msg.get('author', {})
+                    if author.get('type') == 'user':
+                        msg_body = conv_msg.get('body', '')
+                        msg_clean = re.sub('<[^<]+?>', '', msg_body).strip()
+                        if msg_clean:
+                            replies.append({
+                                'created_at': conv_msg.get('created_at'),
+                                'author': author,
+                                'text': msg_clean,
+                            })
+
+                # 2️⃣ conversation_parts container
+                parts_container = conv_detail.get('conversation_parts', {})
+                parts = parts_container.get('conversation_parts', []) if isinstance(parts_container, dict) else []
+                for part in parts:
+                    author = part.get('author', {})
+                    if author.get('type') == 'user':
+                        body = part.get('body', '')
+                        body_plain = re.sub('<[^<]+?>', '', body).strip()
+                        if body_plain:
+                            replies.append({
+                                'created_at': part.get('created_at'),
+                                'author': author,
+                                'text': body_plain,
+                            })
+
+                for rep in replies:
+                    created_dt = datetime.fromtimestamp(rep['created_at']) if rep['created_at'] else datetime.now()
+                    all_results.append({
+                        'user_uuid': str(rep['author'].get('id', '')),
+                        'user_name': str(rep['author'].get('name', '')),
+                        'user_email': str(rep['author'].get('email', '')),
+                        'country': country_code,
+                        'date': created_dt,
+                        'score': score_value,
+                        'review': rep['text'],
+                        'category': matched_cat,
+                        'source': 'chat',
+                    })
+
+            # Pagination – Intercom v2 returns link in "pages.next"
+            next_url = payload.get('pages', {}).get('next')
+
+        logging.info(f"Collected {len(all_results)} chat reviews")
+        return all_results
+
 
 class FetchIntercomData(beam.DoFn):
     """DoFn that fetches raw Intercom data - ORIGINAL LOGIC WITH IMPROVEMENTS."""
@@ -426,7 +589,8 @@ class FetchIntercomData(beam.DoFn):
                         'country': config['country_code'],
                         'date': created_at,
                         'score': score,
-                        'review': feedback
+                        'review': feedback,
+                        'source': 'survey'
                     })
 
             logging.info(f"Processed {len(results)} records for {lang_code}")
@@ -436,6 +600,37 @@ class FetchIntercomData(beam.DoFn):
                     'region': config['country_code'],
                     'results': results
                 }
+
+
+class FetchNPSChatReviews(beam.DoFn):
+    """DoFn that fetches NPS follow-up chat replies and groups them by language."""
+
+    def __init__(self, api_key, start_date, end_date):
+        self.api_key = api_key
+        self.start_date = start_date
+        self.end_date = end_date
+
+    def process(self, _):
+        intercom_service = IntercomService(self.api_key)
+        data = intercom_service.get_nps_chat_reviews(self.start_date, self.end_date)
+
+        if not data:
+            logging.warning("No chat reviews retrieved from Intercom")
+            return
+
+        # Organise into language (by country) bucket to match FetchIntercomData output
+        bucket = {}
+        for row in data:
+            country = row.get('country', '')
+            if not country:
+                continue
+            bucket.setdefault(country, []).append(row)
+
+        for country_code, rows in bucket.items():
+            yield {
+                'region': country_code,
+                'results': rows
+            }
 
 
 class CalculateNPS(beam.DoFn):
@@ -477,8 +672,9 @@ class CalculateNPS(beam.DoFn):
                 logging.debug(f"Skipping data for period {period_str}, expected: {self.run_period}")
                 continue
             
-            # Add data for NPS calculation (only if there is a score)
-            if score is not None:
+            # Add data for NPS calculation (only for *survey*-sourced scores to avoid
+            # inflating metrics with chat replies that have representative scores).
+            if score is not None and result.get('source', 'survey') != 'chat':
                 if period_str not in period_data:
                     period_data[period_str] = {
                         'scores': [],
@@ -500,7 +696,8 @@ class CalculateNPS(beam.DoFn):
                     date=date_obj.strftime('%Y-%m-%d'),
                     quarter=quarter_str,
                     score=int(score) if score is not None else 0,
-                    review=str(result.get('review', ''))
+                    review=str(result.get('review', '')),
+                    category=str(result.get('category', ''))
                 )
                 reviews.append(review_data)
         
@@ -592,7 +789,7 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
                             'title': 'NPS Reviews',
                             'gridProperties': {
                                 'rowCount': 2000,
-                                'columnCount': 8
+                                'columnCount': 9
                             }
                         }
                     }
@@ -606,10 +803,10 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
             # Add headers
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range='NPS Reviews!A1:H1',
+                range='NPS Reviews!A1:I1',
                 valueInputOption='RAW',
                 body={
-                    'values': [['user_uuid', 'user_name', 'user_email', 'country', 'date', 'quarter', 'score', 'review']]
+                    'values': [['user_uuid', 'user_name', 'user_email', 'country', 'date', 'quarter', 'score', 'review', 'category']]
                 }
             ).execute()
             logging.info("Created a new sheet and added headers")
@@ -641,7 +838,8 @@ def write_to_sheets(reviews, spreadsheet_id, spreadsheet_name='NPS Data', creden
                 review_dict.get('date', ''),
                 review_dict.get('quarter', ''),
                 str(review_dict.get('score', 0)),
-                review_dict.get('review', '')
+                review_dict.get('review', ''),
+                review_dict.get('category', '')
             ])
         
         # Write data in batches
@@ -766,17 +964,29 @@ def run(argv=None):
         # Create a dummy input element to kick off the pipeline
         dummy_input = p | "Create Dummy Input" >> beam.Create([None])
         
-        # Fetch data from Intercom - SINGLE REQUEST
-        intercom_data = dummy_input | "Fetch Intercom Data" >> beam.ParDo(
+        # Fetch survey data from Intercom (export) ---------------------------------
+        intercom_data = dummy_input | "Fetch Survey Data" >> beam.ParDo(
             FetchIntercomData(
                 known_args.api_key,
                 start_date,
                 end_date
             )
         )
-        
-        # Calculate NPS and format reviews
-        nps_and_reviews = intercom_data | "Calculate NPS" >> beam.ParDo(
+
+        # Fetch NPS follow-up chat replies -----------------------------------------
+        chat_data = dummy_input | "Fetch Chat Reviews" >> beam.ParDo(
+            FetchNPSChatReviews(
+                known_args.api_key,
+                start_date,
+                end_date
+            )
+        )
+
+        # Combine survey and chat data for downstream processing
+        combined_data = (intercom_data, chat_data) | "Merge Survey & Chat" >> beam.Flatten()
+
+        # Calculate NPS (survey only) and format reviews (both) --------------------
+        nps_and_reviews = combined_data | "Calculate NPS" >> beam.ParDo(
             CalculateNPS(
                 period_type=known_args.period_type,
                 run_period=run_period
